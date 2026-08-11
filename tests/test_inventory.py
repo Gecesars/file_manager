@@ -191,9 +191,11 @@ def test_explorer_is_parameterized_and_reports_possible_presence():
     }
     assert page.total == 1
     assert page.items[0]["presence_confidence"] == "possible"
-    assert "drive_file.sha256" in EXPLORER_SQL
+    assert "drive_file.sha256=source_file.sha256" in EXPLORER_SQL
     assert "drive_file.size=source_file.size" in EXPLORER_SQL
-    assert "ELSE 'possible'" in EXPLORER_SQL
+    assert "'possible'::text AS match_confidence" in EXPLORER_SQL
+    assert "drive_matches AS" in EXPLORER_SQL
+    assert "LEFT JOIN LATERAL (" not in EXPLORER_SQL
 
 
 def test_drive_visibility_and_not_gdrive_filter_are_explicit_sql_contracts():
@@ -208,7 +210,7 @@ def test_drive_visibility_and_not_gdrive_filter_are_explicit_sql_contracts():
     sql, params = database.calls[0]
     assert page.total == 0
     assert params["presence"] == "not_gdrive"
-    assert "%(presence)s='not_gdrive' AND drive_file_id IS NULL" in sql
+    assert "CAST(%(presence)s AS text)='not_gdrive' AND drive_file_id IS NULL" in sql
     assert "own_drive.active AND own_drive.can_download" in sql
     assert "d.active AND d.can_download" in DASHBOARD_SQL
 
@@ -257,6 +259,16 @@ def test_public_transfer_query_redacts_internal_manifests_and_resume_url():
     selected_projection = TRANSFERS_SQL.partition("FROM runtime.transfer_jobs")[0]
     assert "upload_state" not in selected_projection
     assert "selected_file_ids," not in selected_projection
+
+
+def test_nullable_filters_have_explicit_postgres_types():
+    assert "CAST(%(site)s AS text) IS NULL" in EXPLORER_SQL
+    assert "CAST(%(kind)s AS text) IS NULL" in EXPLORER_SQL
+    assert "CAST(%(q)s AS text) IS NULL" in EXPLORER_SQL
+    assert "CAST(%(presence)s AS text) IS NULL" in EXPLORER_SQL
+    assert "CAST(%(state)s AS text) IS NULL" in TRANSFERS_SQL
+    assert "CAST(%(target)s AS text) IS NULL" in TRANSFERS_SQL
+    assert "CAST(%(infohash)s AS text) IS NULL" in TRANSFERS_SQL
 
 
 def test_inventory_filters_and_pagination_are_bounded():

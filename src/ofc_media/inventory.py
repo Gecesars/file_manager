@@ -80,7 +80,7 @@ SELECT
 
 
 EXPLORER_SQL = r"""
-WITH candidate_files AS (
+WITH candidate_files AS NOT MATERIALIZED (
     SELECT
         f.id AS file_id,
         f.torrent_id,
@@ -112,72 +112,98 @@ WITH candidate_files AS (
                 AND own_drive.active AND own_drive.can_download
           )
       )
-      AND (%(site)s IS NULL OR t.site=%(site)s)
-      AND (%(kind)s IS NULL OR f.file_kind=%(kind)s)
+      AND (CAST(%(site)s AS text) IS NULL OR t.site=CAST(%(site)s AS text))
+      AND (CAST(%(kind)s AS text) IS NULL OR f.file_kind=CAST(%(kind)s AS text))
       AND (
-          %(q)s IS NULL
-          OR t.title ILIKE %(q)s ESCAPE E'\\'
-          OR t.display_name ILIKE %(q)s ESCAPE E'\\'
-          OR f.path ILIKE %(q)s ESCAPE E'\\'
-          OR trim(t.infohash) ILIKE %(q)s ESCAPE E'\\'
+          CAST(%(q)s AS text) IS NULL
+          OR t.title ILIKE CAST(%(q)s AS text) ESCAPE E'\\'
+          OR t.display_name ILIKE CAST(%(q)s AS text) ESCAPE E'\\'
+          OR f.path ILIKE CAST(%(q)s AS text) ESCAPE E'\\'
+          OR trim(t.infohash) ILIKE CAST(%(q)s AS text) ESCAPE E'\\'
       )
+), drive_inventory AS MATERIALIZED (
+    SELECT
+        drive.drive_file_id,
+        drive.torrent_file_id AS drive_torrent_file_id,
+        drive.relative_path,
+        drive.updated_at,
+        drive_file.size,
+        trim(drive_file.sha256) AS sha256,
+        lower(regexp_replace(regexp_replace(drive_file.path, '^.*/', ''),
+                             '[^[:alnum:]]+', '', 'g')) AS normalized_name
+    FROM catalog.drive_files drive
+    JOIN catalog.torrent_files drive_file
+      ON drive_file.id=drive.torrent_file_id
+    WHERE drive.active AND drive.can_download
+), drive_matches AS (
+    SELECT
+        source_file.file_id AS source_file_id,
+        drive_file.drive_file_id,
+        drive_file.relative_path,
+        'exact'::text AS match_confidence,
+        0 AS match_priority,
+        drive_file.updated_at
+    FROM drive_inventory drive_file
+    JOIN candidate_files source_file
+      ON source_file.file_id=drive_file.drive_torrent_file_id
+
+    UNION ALL
+
+    SELECT
+        source_file.file_id AS source_file_id,
+        drive_file.drive_file_id,
+        drive_file.relative_path,
+        'exact'::text AS match_confidence,
+        1 AS match_priority,
+        drive_file.updated_at
+    FROM drive_inventory drive_file
+    JOIN candidate_files source_file
+      ON source_file.sha256 IS NOT NULL
+     AND drive_file.sha256 IS NOT NULL
+     AND drive_file.sha256=source_file.sha256
+     AND drive_file.size=source_file.size
+     AND drive_file.drive_torrent_file_id<>source_file.file_id
+
+    UNION ALL
+
+    SELECT
+        source_file.file_id AS source_file_id,
+        drive_file.drive_file_id,
+        drive_file.relative_path,
+        'possible'::text AS match_confidence,
+        2 AS match_priority,
+        drive_file.updated_at
+    FROM drive_inventory drive_file
+    JOIN candidate_files source_file
+      ON drive_file.size=source_file.size
+     AND drive_file.normalized_name=source_file.normalized_name
+     AND (source_file.sha256 IS NULL OR drive_file.sha256 IS NULL)
+     AND drive_file.drive_torrent_file_id<>source_file.file_id
+), best_drive_match AS (
+    SELECT DISTINCT ON (source_file_id)
+        source_file_id,
+        drive_file_id,
+        relative_path,
+        match_confidence
+    FROM drive_matches
+    ORDER BY source_file_id, match_priority, updated_at DESC, drive_file_id
+), local_presence AS MATERIALIZED (
+    SELECT DISTINCT selected.file_id
+    FROM runtime.transfer_jobs local_job
+    CROSS JOIN LATERAL unnest(local_job.selected_file_ids) selected(file_id)
+    WHERE local_job.state='completed'
+      AND jsonb_array_length(local_job.local_files) > 0
 ), matched AS (
     SELECT
         source_file.*,
-        EXISTS (
-            SELECT 1
-            FROM runtime.transfer_jobs local_job
-            WHERE local_job.target='local'
-              AND local_job.state='completed'
-              AND source_file.file_id=ANY(local_job.selected_file_ids)
-        ) AS local_present,
+        (local_file.file_id IS NOT NULL) AS local_present,
         drive_match.drive_file_id,
         drive_match.relative_path AS drive_relative_path,
         drive_match.match_confidence AS drive_match_confidence
     FROM candidate_files source_file
-    LEFT JOIN LATERAL (
-        SELECT
-            drive.drive_file_id,
-            drive.relative_path,
-            CASE
-                WHEN drive_file.id=source_file.file_id THEN 'exact'
-                WHEN source_file.sha256 IS NOT NULL
-                 AND drive_file.sha256 IS NOT NULL
-                 AND trim(drive_file.sha256)=source_file.sha256
-                 AND drive_file.size=source_file.size THEN 'exact'
-                ELSE 'possible'
-            END AS match_confidence
-        FROM catalog.drive_files drive
-        JOIN catalog.torrent_files drive_file ON drive_file.id=drive.torrent_file_id
-        WHERE drive.active
-          AND drive_file.size=source_file.size
-          AND (
-              drive_file.id=source_file.file_id
-              OR (
-                  source_file.sha256 IS NOT NULL
-                  AND drive_file.sha256 IS NOT NULL
-                  AND trim(drive_file.sha256)=source_file.sha256
-              )
-              OR (
-                  (source_file.sha256 IS NULL OR drive_file.sha256 IS NULL)
-                  AND lower(regexp_replace(
-                          regexp_replace(drive_file.path, '^.*/', ''),
-                          '[^[:alnum:]]+', '', 'g'
-                      ))=source_file.normalized_name
-              )
-          )
-        ORDER BY
-            CASE
-                WHEN drive_file.id=source_file.file_id THEN 0
-                WHEN source_file.sha256 IS NOT NULL
-                 AND drive_file.sha256 IS NOT NULL
-                 AND trim(drive_file.sha256)=source_file.sha256 THEN 1
-                ELSE 2
-            END,
-            drive.updated_at DESC,
-            drive.drive_file_id
-        LIMIT 1
-    ) drive_match ON TRUE
+    LEFT JOIN local_presence local_file ON local_file.file_id=source_file.file_id
+    LEFT JOIN best_drive_match drive_match
+      ON drive_match.source_file_id=source_file.file_id
 ), with_presence AS (
     SELECT
         matched.*,
@@ -198,13 +224,14 @@ WITH candidate_files AS (
     SELECT *
     FROM with_presence
     WHERE
-        %(presence)s IS NULL
-        OR (%(presence)s='local' AND local_present)
-        OR (%(presence)s='gdrive' AND drive_file_id IS NOT NULL)
-        OR (%(presence)s='not_gdrive' AND drive_file_id IS NULL)
-        OR (%(presence)s='both' AND local_present AND drive_file_id IS NOT NULL)
-        OR (%(presence)s='missing' AND NOT local_present AND drive_file_id IS NULL)
-        OR (%(presence)s IN ('exact','possible') AND presence_confidence=%(presence)s)
+        CAST(%(presence)s AS text) IS NULL
+        OR (CAST(%(presence)s AS text)='local' AND local_present)
+        OR (CAST(%(presence)s AS text)='gdrive' AND drive_file_id IS NOT NULL)
+        OR (CAST(%(presence)s AS text)='not_gdrive' AND drive_file_id IS NULL)
+        OR (CAST(%(presence)s AS text)='both' AND local_present AND drive_file_id IS NOT NULL)
+        OR (CAST(%(presence)s AS text)='missing' AND NOT local_present AND drive_file_id IS NULL)
+        OR (CAST(%(presence)s AS text) IN ('exact','possible')
+            AND presence_confidence=CAST(%(presence)s AS text))
 )
 SELECT
     (SELECT count(*) FROM selected) AS total_count,
@@ -251,10 +278,10 @@ WITH selected AS (
         started_at,
         finished_at
     FROM runtime.transfer_jobs
-    WHERE (%(state)s IS NULL OR state=%(state)s)
-      AND (%(target)s IS NULL OR target=%(target)s)
-      AND (%(site)s IS NULL OR source_site=%(site)s)
-      AND (%(infohash)s IS NULL OR infohash=%(infohash)s)
+    WHERE (CAST(%(state)s AS text) IS NULL OR state=CAST(%(state)s AS text))
+      AND (CAST(%(target)s AS text) IS NULL OR target=CAST(%(target)s AS text))
+      AND (CAST(%(site)s AS text) IS NULL OR source_site=CAST(%(site)s AS text))
+      AND (CAST(%(infohash)s AS text) IS NULL OR infohash=CAST(%(infohash)s AS text))
 )
 SELECT
     (SELECT count(*) FROM selected) AS total_count,
