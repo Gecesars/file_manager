@@ -1,0 +1,264 @@
+name: file-manager
+
+x-app: &app
+  image: file-manager:2.0.0
+  restart: unless-stopped
+  env_file: ${FILE_MANAGER_ENV_FILE:-.env}
+  environment: &app-env
+    DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    REDIS_URL: redis://redis:6379/0
+    OFC_INTERNAL_TOKEN: ${OFC_INTERNAL_TOKEN}
+    OFC_SESSION_PEPPER: ${OFC_SESSION_PEPPER}
+    OFC_PLAYBACK_TTL_SECONDS: ${OFC_PLAYBACK_TTL_SECONDS:-43200}
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  read_only: true
+  tmpfs:
+    - /tmp:size=256m,mode=1777
+  networks:
+    - backend
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    env_file: ${FILE_MANAGER_ENV_FILE:-.env}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - backend
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  migrate:
+    <<: *app
+    restart: "no"
+    command: ["python3", "-m", "ofc_media.migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  catalog-sync:
+    <<: *app
+    command: ["python3", "-m", "ofc_media.catalog_sync", "--watch"]
+    environment:
+      <<: *app-env
+      OFC_SYNC_INTERVAL: ${OFC_SYNC_INTERVAL:-120}
+      FILECR_DB: /sources/filecr/inventory.sqlite3
+      X1337_DB: /sources/1337x/inventory.sqlite3
+      METADATA_DB: /sources/web/catalog_metadata.sqlite3
+      SUBTITLE_DB: /sources/subtitles/subtitles.sqlite3
+      FILECR_HOST_TORRENT_ROOT: D:/dev/Torrents/FileCR/torrents
+      X1337_HOST_TORRENT_ROOT: D:/dev/Torrents/1337xVault/downloads
+    volumes:
+      - D:/dev/Torrents/FileCR/data:/sources/filecr:ro
+      - D:/dev/Torrents/1337xVault/data:/sources/1337x:ro
+      - D:/dev/Torrents/FileCRWeb/data:/sources/web:ro
+      - D:/dev/Torrents/SubtitleVault/data:/sources/subtitles:ro
+      - ./storage/snapshots:/snapshots
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-m", "ofc_media.healthcheck", "sync"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  torrent-engine:
+    <<: *app
+    command: ["gunicorn", "--bind", "0.0.0.0:7101", "--workers", "1", "--threads", "8", "--timeout", "0", "ofc_media.torrent_service:create_app()"]
+    environment:
+      <<: *app-env
+      FILECR_TORRENT_ROOT: /torrent-sources/filecr
+      X1337_TORRENT_ROOT: /torrent-sources/1337x
+      MEDIA_ROOT: /media
+      RESUME_ROOT: /resume
+    volumes:
+      - D:/dev/Torrents/FileCR/torrents:/torrent-sources/filecr:ro
+      - D:/dev/Torrents/1337xVault/downloads:/torrent-sources/1337x:ro
+      - ./storage/media:/media
+      - ./storage/resume:/resume
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+      - egress
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7101/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 3g
+
+  gdrive-source:
+    <<: *app
+    command: ["gunicorn", "--bind", "0.0.0.0:7103", "--workers", "1", "--threads", "8", "--timeout", "0", "ofc_media.drive_service:create_app()"]
+    environment:
+      <<: *app-env
+      OFC_GDRIVE_ROOT_ID: ${OFC_GDRIVE_ROOT_ID}
+      OFC_GDRIVE_TOKEN_PATH: /run/secrets/gdrive/token.json
+      OFC_GDRIVE_SYNC_INTERVAL: ${OFC_GDRIVE_SYNC_INTERVAL:-300}
+    volumes:
+      - D:/dev/Avideos/token.json:/run/secrets/gdrive/token.json:ro
+      - ./storage/media:/media
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks:
+      - backend
+      - egress
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7103/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  transcoder:
+    <<: *app
+    command: ["gunicorn", "--bind", "0.0.0.0:7102", "--workers", "1", "--threads", "4", "--timeout", "0", "ofc_media.transcode_service:create_app()"]
+    environment:
+      <<: *app-env
+      HLS_ROOT: /hls
+      TORRENT_ENGINE_URL: http://torrent-engine:7101
+      DRIVE_SOURCE_URL: http://gdrive-source:7103
+      OFC_TRANSCODE_ENCODER: ${OFC_TRANSCODE_ENCODER:-auto}
+      OFC_MAX_TRANSCODES: ${OFC_MAX_TRANSCODES:-1}
+    volumes:
+      - ./storage/hls:/hls
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      torrent-engine:
+        condition: service_healthy
+      gdrive-source:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7102/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "6.0"
+          memory: 6g
+
+  control:
+    <<: *app
+    build:
+      context: .
+    command: ["gunicorn", "--bind", "0.0.0.0:7100", "--workers", "2", "--threads", "4", "--timeout", "60", "ofc_media.control:create_app()"]
+    environment:
+      <<: *app-env
+      TORRENT_ENGINE_URL: http://torrent-engine:7101
+      DRIVE_SOURCE_URL: http://gdrive-source:7103
+      TRANSCODER_URL: http://transcoder:7102
+      PUBLIC_BASE_URL: http://127.0.0.1:${OFC_PUBLIC_PORT:-5090}
+      VENDOR_HLS_PATH: /app/vendor/hls.mjs
+      SUBTITLE_FILE_ROOT: /subtitle-files
+      SUBTITLE_HOST_ROOT: D:/dev/Torrents/SubtitleVault/subtitles
+    volumes:
+      - D:/dev/Torrents/SubtitleVault/subtitles:/subtitle-files:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      torrent-engine:
+        condition: service_healthy
+      gdrive-source:
+        condition: service_started
+      transcoder:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7100/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  gateway:
+    image: nginx:1.29-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${OFC_PUBLIC_PORT:-5090}:8080"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./storage/hls:/hls:ro
+    depends_on:
+      control:
+        condition: service_healthy
+    networks:
+      - backend
+      - frontend
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx:size=64m
+      - /var/run:size=8m
+      - /tmp:size=32m
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres-data:
+
+networks:
+  backend:
+    internal: true
+  frontend:
+  egress:

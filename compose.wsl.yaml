@@ -1,0 +1,76 @@
+# Sobreposicao para executar a plataforma a partir do filesystem ext4 do WSL.
+# Os bancos dos rastreadores continuam em D: e entram nos containers somente
+# para leitura. Use sempre junto de compose.yaml.
+services:
+  migrate:
+    image: file-manager:wsl-2.0.0
+
+  catalog-sync:
+    image: file-manager:wsl-2.0.0
+    volumes:
+      - type: bind
+        source: ${OFC_FILECR_DATA_DIR:-/run/desktop/mnt/host/d/dev/Torrents/FileCR/data}
+        target: /sources/filecr
+        read_only: true
+      - type: bind
+        source: ${OFC_1337X_DATA_DIR:-/run/desktop/mnt/host/d/dev/Torrents/1337xVault/data}
+        target: /sources/1337x
+        read_only: true
+      - type: bind
+        source: ${OFC_WEB_DATA_DIR:-/run/desktop/mnt/host/d/dev/Torrents/FileCRWeb/data}
+        target: /sources/web
+        read_only: true
+      - type: bind
+        source: ${OFC_SUBTITLE_DATA_DIR:-/run/desktop/mnt/host/d/dev/Torrents/SubtitleVault/data}
+        target: /sources/subtitles
+        read_only: true
+      - wsl-snapshots:/snapshots
+
+  torrent-engine:
+    image: file-manager:wsl-2.0.0
+    volumes:
+      - type: bind
+        source: ${OFC_FILECR_TORRENT_DIR:-/run/desktop/mnt/host/d/dev/Torrents/FileCR/torrents}
+        target: /torrent-sources/filecr
+        read_only: true
+      - type: bind
+        source: ${OFC_1337X_TORRENT_DIR:-/run/desktop/mnt/host/d/dev/Torrents/1337xVault/downloads}
+        target: /torrent-sources/1337x
+        read_only: true
+      - wsl-media:/media
+      - wsl-resume:/resume
+
+  gdrive-source:
+    image: file-manager:wsl-2.0.0
+    volumes: !override
+      - type: bind
+        source: ${OFC_GDRIVE_TOKEN_FILE:-/run/desktop/mnt/host/d/dev/Avideos/token.json}
+        target: /run/secrets/gdrive/token.json
+        read_only: true
+      - wsl-media:/media
+
+  transcoder:
+    image: file-manager:wsl-2.0.0
+    volumes:
+      - wsl-hls:/hls
+
+  control:
+    image: file-manager:wsl-2.0.0
+    volumes:
+      - type: bind
+        source: ${OFC_SUBTITLE_FILES_DIR:-/run/desktop/mnt/host/d/dev/Torrents/SubtitleVault/subtitles}
+        target: /subtitle-files
+        read_only: true
+
+  gateway:
+    image: file-manager-gateway:wsl-2.0.0
+    build:
+      context: ./docker/nginx
+    volumes: !override
+      - wsl-hls:/hls:ro
+
+volumes:
+  wsl-hls:
+  wsl-media:
+  wsl-resume:
+  wsl-snapshots:

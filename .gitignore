@@ -1,0 +1,61 @@
+# Credenciais e configuracoes locais (nunca versionar)
+.env
+.env.*
+!.env.example
+!.env.wsl.example
+credentials.json
+credentials.*.json
+token.json
+token.*.json
+client_secret*.json
+
+# Bancos vivos, metainfo e dados baixados
+*.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
+*.torrent
+*.fastresume
+data/
+downloads/
+
+# Dados operacionais da plataforma
+storage/hls/*
+storage/media/*
+storage/resume/*
+storage/snapshots/*
+storage/uploads/*
+storage/logs/*
+!storage/hls/.gitkeep
+!storage/media/.gitkeep
+!storage/resume/.gitkeep
+!storage/snapshots/.gitkeep
+!storage/uploads/.gitkeep
+!storage/logs/.gitkeep
+logs/*
+!logs/.gitkeep
+
+# Saidas das ferramentas legadas do Drive
+plano.csv
+movimentos.csv
+movimentos.csv.revertido
+
+# Python e ferramentas
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Editores e sistema operacional
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

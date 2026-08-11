@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>File Manager</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#library" aria-label="File Manager">
+      <span class="brand-mark">FM</span>
+      <span><strong>File Manager</strong><small>Drive &amp; Torrent Operations</small></span>
+    </a>
+    <nav class="tabs" aria-label="Áreas do painel" role="tablist">
+      <button class="tab active" id="tab-library" data-view-button="library" type="button" role="tab" aria-selected="true" aria-controls="panel-library">Biblioteca</button>
+      <button class="tab" id="tab-files" data-view-button="files" type="button" role="tab" aria-selected="false" aria-controls="panel-files" tabindex="-1">Arquivos</button>
+      <button class="tab" id="tab-transfers" data-view-button="transfers" type="button" role="tab" aria-selected="false" aria-controls="panel-transfers" tabindex="-1">Transferências</button>
+    </nav>
+    <button class="health" data-health type="button" aria-live="polite">Verificando serviços…</button>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div>
+        <span class="eyebrow">Inventário unificado · v{{ version }}</span>
+        <h1>Seu acervo, de qualquer origem.</h1>
+        <p>Explore torrents e Google Drive, reproduza mídia e publique arquivos classificados sem interromper os coletores.</p>
+      </div>
+      <button class="primary hero-action" data-sync-drive type="button">Sincronizar Drive</button>
+    </section>
+
+    <section class="stats" aria-label="Resumo do inventário">
+      <article><span>Títulos</span><strong data-stat="titles">—</strong><small>em todas as fontes</small></article>
+      <article><span>Arquivos</span><strong data-stat="files">—</strong><small>descritos nos inventários</small></article>
+      <article><span>No Drive</span><strong data-stat="drive">—</strong><small>blobs catalogados</small></article>
+      <article><span>Em andamento</span><strong data-stat="active">—</strong><small>downloads e uploads</small></article>
+    </section>
+
+    <section class="workspace" id="panel-library" data-view="library" role="tabpanel" aria-labelledby="tab-library">
+      <div class="section-head">
+        <div><span class="eyebrow">Streaming</span><h2>Biblioteca de mídia</h2></div>
+        <span class="result-count" data-catalog-total aria-live="polite"></span>
+      </div>
+      <div class="toolbar">
+        <label class="search-field"><span class="sr-only">Pesquisar</span><input data-catalog-query type="search" placeholder="Título, release ou categoria"></label>
+        <select data-catalog-site aria-label="Fonte"><option value="">Todas as fontes</option><option value="gdrive">Google Drive</option><option value="1337x">1337x</option><option value="filecr">FileCR</option></select>
+        <select data-category aria-label="Categoria"><option value="">Todas as categorias</option></select>
+        <select data-sort aria-label="Ordenação"><option value="popular">Mais compartilhados</option><option value="rating">Maior nota</option><option value="recent">Mais recentes</option></select>
+        <button class="primary" data-catalog-search type="button">Pesquisar</button>
+      </div>
+      <div class="grid" data-grid></div>
+      <div class="empty" data-catalog-empty hidden><strong>Nenhum título encontrado</strong><span>Ajuste os filtros e tente novamente.</span></div>
+      <nav class="pagination" data-catalog-pagination aria-label="Paginação da biblioteca" hidden>
+        <button class="secondary" data-catalog-prev type="button">Anterior</button>
+        <span data-catalog-page aria-live="polite"></span>
+        <button class="secondary" data-catalog-next type="button">Próxima</button>
+      </nav>
+    </section>
+
+    <section class="workspace" id="panel-files" data-view="files" role="tabpanel" aria-labelledby="tab-files" hidden>
+      <div class="section-head">
+        <div><span class="eyebrow">Explorador</span><h2>Todos os arquivos</h2></div>
+        <span class="result-count" data-files-total aria-live="polite"></span>
+      </div>
+      <div class="toolbar files-toolbar">
+        <label class="search-field"><span class="sr-only">Pesquisar arquivo</span><input data-files-query type="search" placeholder="Nome, caminho, título ou hash"></label>
+        <select data-files-site aria-label="Fonte"><option value="">Todas as fontes</option><option value="gdrive">Google Drive</option><option value="1337x">1337x</option><option value="filecr">FileCR</option></select>
+        <select data-kind aria-label="Tipo"><option value="">Todos os tipos</option><option value="video">Vídeo</option><option value="audio">Áudio</option><option value="subtitle">Legenda</option><option value="image">Imagem</option><option value="document">Documento</option><option value="archive">Arquivo compactado</option><option value="software">Software</option><option value="dataset">Dataset</option><option value="other">Outros</option></select>
+        <select data-presence aria-label="Presença"><option value="">Qualquer presença</option><option value="gdrive">Já está no Drive</option><option value="not_gdrive">Fora do Drive</option><option value="local">Disponível localmente</option><option value="both">Local e Drive</option><option value="missing">Sem cópia disponível</option><option value="exact">Correspondência exata</option><option value="possible">Possível duplicata</option></select>
+        <button class="primary" data-files-search type="button">Pesquisar</button>
+      </div>
+      <div class="table-shell" role="region" aria-label="Tabela de arquivos" tabindex="0">
+        <table>
+          <caption class="sr-only">Arquivos encontrados no inventário unificado</caption>
+          <thead><tr><th>Arquivo</th><th>Tipo</th><th>Fonte</th><th>Tamanho</th><th>Presença</th><th><span class="sr-only">Ações</span></th></tr></thead>
+          <tbody data-files-body></tbody>
+        </table>
+      </div>
+      <div class="empty" data-files-empty hidden><strong>Nenhum arquivo encontrado</strong><span>Os bancos continuam sendo sincronizados em segundo plano.</span></div>
+      <nav class="pagination" data-files-pagination aria-label="Paginação dos arquivos" hidden>
+        <button class="secondary" data-files-prev type="button">Anterior</button>
+        <span data-files-page aria-live="polite"></span>
+        <button class="secondary" data-files-next type="button">Próxima</button>
+      </nav>
+    </section>
+
+    <section class="workspace" id="panel-transfers" data-view="transfers" role="tabpanel" aria-labelledby="tab-transfers" hidden>
+      <div class="section-head">
+        <div><span class="eyebrow">Operações persistentes</span><h2>Transferências</h2></div>
+        <button class="secondary" data-refresh-transfers type="button">Atualizar</button>
+      </div>
+      <div class="transfer-list" data-transfer-list></div>
+      <div class="empty" data-transfer-empty hidden><strong>Nenhuma transferência ainda</strong><span>Escolha um arquivo e use “Disponibilizar no Drive” ou “Baixar local”.</span></div>
+      <nav class="pagination" data-transfers-pagination aria-label="Paginação das transferências" hidden>
+        <button class="secondary" data-transfers-prev type="button">Anterior</button>
+        <span data-transfers-page aria-live="polite"></span>
+        <button class="secondary" data-transfers-next type="button">Próxima</button>
+      </nav>
+    </section>
+
+    <section class="player" data-player hidden>
+      <div class="player-head">
+        <div><span class="eyebrow">Sessão protegida</span><h2 data-player-title></h2><p data-player-file></p></div>
+        <button class="secondary" data-close type="button">Encerrar</button>
+      </div>
+      <video data-video controls playsinline aria-label="Reprodutor de mídia"></video>
+      <div class="player-actions"><button class="primary" type="button" data-start hidden>Iniciar reprodução</button></div>
+      <div class="metrics">
+        <span>Estado <strong data-state>—</strong></span>
+        <span>Download <strong data-rate>—</strong></span>
+        <span><span data-swarm-label>Seeds/peers</span> <strong data-swarm>—</strong></span>
+        <span>Buffer <strong data-buffer>—</strong></span>
+        <span>Estratégia <strong data-strategy>—</strong></span>
+      </div>
+      <p class="status" data-status role="status" aria-live="polite"></p>
+      <details><summary>Diagnóstico técnico</summary><pre data-diagnostics></pre></details>
+    </section>
+  </main>
+
+  <dialog data-detail aria-labelledby="detail-title" aria-describedby="detail-description">
+    <form method="dialog"><button class="dialog-close" aria-label="Fechar">×</button></form>
+    <div data-detail-body></div>
+  </dialog>
+
+  <div class="toast-region" data-toasts aria-live="polite"></div>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

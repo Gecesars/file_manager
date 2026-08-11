@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "file-manager"
+version = "2.0.0"
+description = "Inventario unificado, streaming e publicacao classificada no Google Drive"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "flask>=3.1,<4",
+  "gunicorn>=23,<24",
+  "psycopg[binary,pool]>=3.2,<4",
+  "redis>=6,<7",
+  "requests>=2.32,<3",
+  "google-auth>=2.40,<3",
+  "google-auth-oauthlib>=1.2,<2",
+  "google-api-python-client>=2.170,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+file-manager-migrate = "ofc_media.migrate:main"
+file-manager-sync = "ofc_media.catalog_sync:main"
+file-manager-control = "ofc_media.control:main"
+file-manager-torrent = "ofc_media.torrent_service:main"
+file-manager-transcoder = "ofc_media.transcode_service:main"
+file-manager-drive = "ofc_media.drive_service:main"
+ofc-migrate = "ofc_media.migrate:main"
+ofc-catalog-sync = "ofc_media.catalog_sync:main"
+ofc-compare = "ofc_media.compare_inventory:main"
+ofc-control = "ofc_media.control:main"
+ofc-torrent-engine = "ofc_media.torrent_service:main"
+ofc-transcoder = "ofc_media.transcode_service:main"
+ofc-drive-source = "ofc_media.drive_service:main"
+ofc-smoke-media = "ofc_media.smoke_media:main"
+ofc-smoke-gateway = "ofc_media.smoke_gateway:main"
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ofc_media"]
