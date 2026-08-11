@@ -64,6 +64,10 @@ transfer_job: queued → validating → downloading → downloaded
 Consulte [ARCHITECTURE.md](ARCHITECTURE.md) para o modelo de dados, fronteiras de
 serviço e decisões de retomada.
 
+O procedimento de migração, o conteúdo do backup portátil e os hashes do
+artefato atualmente salvo em `#Avideos/Backups` estão documentados em
+[docs/BACKUP_LINUX.md](docs/BACKUP_LINUX.md).
+
 ## Início rápido no Windows
 
 Requisitos:
