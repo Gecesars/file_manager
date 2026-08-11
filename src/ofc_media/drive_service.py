@@ -725,12 +725,12 @@ class DriveClient:
     def ensure_folder_path(self, root_id: str, relative_path: str | None) -> str:
         if not DRIVE_ID_RE.fullmatch(root_id):
             raise UnsafeMediaError("pasta raiz Google Drive invalida")
-        raw = (relative_path or "").replace("\\", "/").strip("/")
-        if not raw:
+        raw = str(relative_path or "")
+        if not raw.strip():
             return root_id
-        safe = safe_relative_path(raw)
+        raw_parts, _ = _portable_parts(raw)
         parent_id = root_id
-        for component in safe.split("/"):
+        for component in raw_parts:
             parent_id = self.ensure_folder(parent_id, component)
         return parent_id
 
@@ -1815,38 +1815,31 @@ def unique_relative_paths(
     return result
 
 
-def relative_to_destination_group(paths: list[str], destination: Path) -> list[str]:
-    """Remove prefixo ja representado pelo destino, sem achatar subpastas."""
-    if not paths:
-        return []
-    split_paths = [path.split("/") for path in paths]
-    parent_parts = [parts[:-1] for parts in split_paths]
-    common: list[str] = []
-    for values in zip(*parent_parts):
-        if len({unicodedata.normalize("NFKC", value).casefold() for value in values}) != 1:
-            break
-        common.append(values[0])
-    if not common:
-        return paths
+def relative_to_destination_group(
+    paths: list[str], destination: Path | str
+) -> list[str]:
+    """Remove apenas a sobreposicao raiz->prefixo, preservando o restante da arvore."""
     destination_parts = [
         unicodedata.normalize("NFKC", value).casefold()
-        for value in destination.parts
-        if value not in {destination.anchor, "", os.sep}
+        for value in Path(destination).parts
+        if value not in {Path(destination).anchor, "", os.sep}
     ]
-    folded_common = [unicodedata.normalize("NFKC", value).casefold() for value in common]
-    strip = 0
-    for length in range(min(len(destination_parts), len(common)), 0, -1):
-        if destination_parts[-length:] == folded_common[:length]:
-            strip = length
-            break
-    if strip == 0:
-        for length in range(min(len(destination_parts), len(common)), 0, -1):
-            if destination_parts[-length:] == folded_common[-length:]:
-                strip = len(common)
+    result: list[str] = []
+    for path in paths:
+        parts = path.split("/")
+        folded = [
+            unicodedata.normalize("NFKC", value).casefold() for value in parts
+        ]
+        # Nunca consome o ultimo componente: ele e o nome do arquivo e a
+        # arvore resultante precisa continuar sendo um caminho de arquivo.
+        maximum = min(len(destination_parts), max(0, len(parts) - 1))
+        strip = 0
+        for length in range(maximum, 0, -1):
+            if destination_parts[-length:] == folded[:length]:
+                strip = length
                 break
-    if strip == 0:
-        return paths
-    return ["/".join(parts[strip:]) for parts in split_paths]
+        result.append("/".join(parts[strip:]))
+    return result
 
 
 def _assert_unique_relative_paths(paths: Iterable[str]) -> None:
@@ -1856,6 +1849,46 @@ def _assert_unique_relative_paths(paths: Iterable[str]) -> None:
         if folded in seen:
             raise UnsafeMediaError("manifesto produz caminhos locais colidentes")
         seen.add(folded)
+
+
+def _local_file_matches_metadata(
+    path: Path, metadata: Mapping[str, Any]
+) -> bool:
+    if not path.is_file():
+        return False
+    size = int(metadata.get("size") or 0)
+    if size <= 0 or path.stat().st_size != size:
+        return False
+    try:
+        verify_uploaded_metadata(
+            metadata, size=size, checksums=file_checksums(path)
+        )
+    except RuntimeError:
+        return False
+    return True
+
+
+def _collision_safe_local_relative(
+    destination_root: Path,
+    relative: str,
+    file_id: str,
+    metadata: Mapping[str, Any],
+) -> str:
+    """Mantem o nome quando livre/identico ou usa um sufixo estavel por fileId."""
+    destination = destination_root / Path(relative)
+    _assert_no_reparse_points(destination, stop_at=destination_root)
+    if not destination.exists() or _local_file_matches_metadata(destination, metadata):
+        return relative
+    parts = relative.split("/")
+    parts[-1] = _identity_suffix(parts[-1], f"gdrive:{file_id}")
+    alternate = "/".join(parts)
+    alternate_path = destination_root / Path(alternate)
+    _assert_no_reparse_points(alternate_path, stop_at=destination_root)
+    if not alternate_path.exists() or _local_file_matches_metadata(
+        alternate_path, metadata
+    ):
+        return alternate
+    raise RuntimeError("colisao local deterministica com conteudo divergente")
 
 
 class DriveTransferWorker:
@@ -1901,7 +1934,8 @@ class DriveTransferWorker:
         if not raw:
             path_value = item.get("path")
             raw = source.name if not path_value or Path(str(path_value)).is_absolute() else path_value
-        return safe_relative_path(str(raw).replace("\\", "/"))
+        raw_parts, _ = _portable_parts(str(raw))
+        return "/".join(raw_parts)
 
     @classmethod
     def _relative_name(cls, item: Mapping[str, Any], source: Path) -> str:
@@ -1912,7 +1946,8 @@ class DriveTransferWorker:
         raw = str(value or "").strip()
         candidate = Path(raw) if raw else root
         if not candidate.is_absolute():
-            candidate = root / safe_relative_path(raw)
+            _, portable_parts = _portable_parts(raw)
+            candidate = root.joinpath(*portable_parts)
         lexical = candidate.absolute()
         if not _inside(root, lexical):
             raise UnsafeMediaError("destination_path local fora da raiz autorizada")
@@ -2048,6 +2083,9 @@ class DriveTransferWorker:
         if not local_items:
             raise RuntimeError("job gdrive nao possui local_files")
         raw_sources = [(item, self._source_path(item)) for item in local_items]
+        source_paths = [str(source).casefold() for _, source in raw_sources]
+        if len(source_paths) != len(set(source_paths)):
+            raise UnsafeMediaError("manifesto local referencia a mesma origem mais de uma vez")
         legacy_names = {
             index: self._raw_relative_name(item, source)
             for index, (item, source) in enumerate(raw_sources)
@@ -2064,6 +2102,23 @@ class DriveTransferWorker:
             )
             for index, (item, source) in enumerate(raw_sources)
         )
+        destination_path = str(job.get("destination_path") or "")
+        relative_values = relative_to_destination_group(
+            [relative_names[index] for index in range(len(raw_sources))],
+            destination_path,
+        )
+        relative_names = unique_relative_paths(
+            (
+                index,
+                relative,
+                str(
+                    raw_sources[index][0].get("file_id")
+                    or raw_sources[index][0].get("torrent_file_id")
+                    or raw_sources[index][1]
+                ),
+            )
+            for index, relative in enumerate(relative_values)
+        )
         # Jobs iniciados por versoes anteriores persistiam a chave antes da
         # sanitizacao. Preserva-la evita criar um segundo arquivo ao retomar.
         for index, legacy in legacy_names.items():
@@ -2076,7 +2131,7 @@ class DriveTransferWorker:
         _assert_unique_relative_paths(relative for _, _, relative in sources)
         total = sum(path.stat().st_size for _, path, _ in sources)
         base_folder = self.client.ensure_folder_path(
-            self.settings.gdrive_root_id, str(job.get("destination_path") or "")
+            self.settings.gdrive_root_id, destination_path
         )
         completed_bytes = 0
         for existing in file_states.values():
@@ -2198,6 +2253,9 @@ class DriveTransferWorker:
         if not drive_items:
             raise RuntimeError("job local nao possui drive_files")
         raw_normalized = [self._remote_metadata(item) for item in drive_items]
+        drive_ids = [file_id for file_id, _, _ in raw_normalized]
+        if len(drive_ids) != len(set(drive_ids)):
+            raise UnsafeMediaError("manifesto Drive referencia o mesmo arquivo mais de uma vez")
         destination_root = self._destination_root(job.get("destination_path"))
         unique_names = unique_relative_paths(
             (index, relative, file_id)
@@ -2225,6 +2283,40 @@ class DriveTransferWorker:
                 remote = self.client.get_file_metadata(file_id)
                 if remote:
                     metadata.update(remote)
+        persisted_relatives: dict[str, str] = {}
+        for item in _manifest_items(job.get("local_files")):
+            persisted_id = str(item.get("drive_file_id") or "")
+            if not persisted_id:
+                continue
+            if persisted_id in persisted_relatives:
+                raise UnsafeMediaError(
+                    "manifesto local possui fileId Drive duplicado"
+                )
+            persisted_raw = item.get("relative_path")
+            if not persisted_raw:
+                continue
+            persisted = portable_relative_path(str(persisted_raw))
+            persisted = relative_to_destination_group(
+                [persisted], destination_root
+            )[0]
+            persisted_relatives[persisted_id] = persisted
+        collision_safe: list[tuple[str, dict[str, Any], str]] = []
+        for file_id, metadata, relative in normalized:
+            persisted = persisted_relatives.get(file_id)
+            if persisted:
+                parts = relative.split("/")
+                parts[-1] = _identity_suffix(parts[-1], f"gdrive:{file_id}")
+                if persisted not in {relative, "/".join(parts)}:
+                    raise UnsafeMediaError(
+                        "manifesto local diverge da arvore Drive normalizada"
+                    )
+                relative = persisted
+            relative = _collision_safe_local_relative(
+                destination_root, relative, file_id, metadata
+            )
+            collision_safe.append((file_id, metadata, relative))
+        normalized = collision_safe
+        _assert_unique_relative_paths(relative for _, _, relative in normalized)
         total = sum(int(metadata.get("size") or 0) for _, metadata, _ in normalized)
         if job_state in {"downloaded", "classifying", "verifying"}:
             local_files, verified_total = self._verify_local_files(

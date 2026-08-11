@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import atexit
+import errno
+import hashlib
 import json
 import logging
 import os
+import shutil
+import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -61,6 +66,22 @@ def _normalized_job_id(value: str) -> str:
         raise UnsafeMediaError("job invalido") from exc
 
 
+def _relative_to_classified_root(relative_path: str, destination_path: str) -> str:
+    """Remove somente a raiz ja representada, sem achatar a subarvore."""
+
+    relative = safe_relative_path(relative_path).split("/")
+    destination = safe_relative_path(destination_path).split("/")
+    folded_relative = [unicodedata.normalize("NFKC", part).casefold() for part in relative]
+    folded_destination = [
+        unicodedata.normalize("NFKC", part).casefold() for part in destination
+    ]
+    maximum = min(len(folded_destination), max(0, len(folded_relative) - 1))
+    for length in range(maximum, 0, -1):
+        if folded_destination[-length:] == folded_relative[:length]:
+            return "/".join(relative[length:])
+    return "/".join(relative)
+
+
 @dataclass(slots=True)
 class SharedDownload:
     key: str
@@ -111,6 +132,7 @@ class Materialization:
     target: str
     files: tuple[MaterializedFile, ...]
     bytes_total: int
+    destination_path: str = ""
 
 
 class TorrentEngine:
@@ -264,7 +286,8 @@ class TorrentEngine:
                 """
                 SELECT j.id::text AS id,j.source_site,trim(j.infohash) AS infohash,
                        j.target,j.state,j.selected_file_ids,j.bytes_total,j.bytes_done,
-                       j.local_files,j.error,t.id AS torrent_id,t.metainfo_relpath
+                       j.local_files,j.error,j.destination_path,
+                       t.id AS torrent_id,t.metainfo_relpath
                 FROM runtime.transfer_jobs j
                 JOIN catalog.torrents t
                   ON t.site=j.source_site AND t.infohash=j.infohash
@@ -301,7 +324,7 @@ class TorrentEngine:
                 """
                 SELECT id::text AS id,source_site,trim(infohash) AS infohash,target,
                        state,selected_file_ids,bytes_total,bytes_done,local_files,
-                       error,updated_at
+                       destination_path,error,updated_at
                 FROM runtime.transfer_jobs WHERE id=%s
                 """,
                 (job_id,),
@@ -466,12 +489,43 @@ class TorrentEngine:
             self._write_transfer_error(job_id, exc)
             return False
 
+        current_state = state
+        if current_state == "downloaded":
+            claimed = self._write_transfer_progress(
+                job_id,
+                state="classifying",
+                bytes_total=total,
+                bytes_done=total,
+                local_files=local_files,
+                error=None,
+                expected_states=("downloaded",),
+            )
+            if claimed is False:
+                return False
+            current_state = "classifying"
+
+        try:
+            item = self._local_completion_materialization(status, local_files)
+            local_files = self._publish_local_files(item, local_files)
+        except (TypeError, ValueError, UnsafeMediaError) as exc:
+            self._write_transfer_error(job_id, exc)
+            return False
+        recorded = self._write_transfer_progress(
+            job_id,
+            state=current_state,
+            bytes_total=total,
+            bytes_done=total,
+            local_files=local_files,
+            error=None,
+            expected_states=(current_state,),
+        )
+        if recorded is False:
+            return False
+
         transitions = {
-            "downloaded": ("classifying", "verifying", "completed"),
             "classifying": ("verifying", "completed"),
             "verifying": ("completed",),
-        }[state]
-        current_state = state
+        }[current_state]
         for next_state in transitions:
             updated = self._write_transfer_progress(
                 job_id,
@@ -488,6 +542,51 @@ class TorrentEngine:
                 return False
             current_state = next_state
         return True
+
+    @staticmethod
+    def _local_completion_materialization(
+        status: dict[str, Any],
+        local_files: Sequence[dict[str, object]],
+    ) -> Materialization:
+        source_site = str(status.get("source_site") or "").strip().casefold()
+        infohash = normalized_infohash(str(status.get("infohash") or ""))
+        destination_path = safe_relative_path(
+            str(status.get("destination_path") or "")
+        )
+        files: list[MaterializedFile] = []
+        for ordinal, manifest in enumerate(local_files):
+            try:
+                file_id = int(manifest["file_id"])
+                file_size = int(manifest["size"])
+                relative_path = safe_relative_path(
+                    str(manifest.get("relative_path") or manifest["path"])
+                )
+                persisted_source = manifest.get("source_path")
+                source_path = Path(str(persisted_source)) if persisted_source else None
+                if source_path is None or not source_path.exists():
+                    source_path = Path(str(manifest["local_path"]))
+                file_index = int(manifest.get("file_index") or ordinal)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise UnsafeMediaError(
+                    "manifesto local insuficiente para classificacao"
+                ) from exc
+            files.append(
+                MaterializedFile(
+                    catalog_file_id=file_id,
+                    file_index=file_index,
+                    relative_path=relative_path,
+                    file_size=file_size,
+                    file_path=source_path,
+                )
+            )
+        return Materialization(
+            id=str(status.get("id") or ""),
+            download_key=f"{source_site}-{infohash}",
+            target="local",
+            files=tuple(files),
+            bytes_total=int(status.get("bytes_total") or 0),
+            destination_path=destination_path,
+        )
 
     def _recover_materializations_once(self) -> int:
         recovered = 0
@@ -856,6 +955,7 @@ class TorrentEngine:
                 target=str(job["target"]),
                 files=files,
                 bytes_total=sum(value.file_size for value in files),
+                destination_path=str(job.get("destination_path") or ""),
             )
             with self.lock:
                 existing = self.materializations.get(job_id)
@@ -938,6 +1038,7 @@ class TorrentEngine:
         bytes_done: int,
         local_files: Sequence[dict[str, object]],
     ) -> str:
+        persisted_files = list(local_files)
         expected_states = (
             ("validating", "downloading", "downloaded")
             if state == "downloaded"
@@ -948,20 +1049,45 @@ class TorrentEngine:
             state=state,
             bytes_total=item.bytes_total,
             bytes_done=bytes_done,
-            local_files=local_files,
+            local_files=persisted_files,
             expected_states=expected_states,
         )
         if updated is False:
             return str(self._read_transfer_status(item.id)["state"]).casefold()
         if state == "downloaded" and item.target == "local":
-            current_state = "downloaded"
-            for final_state in ("classifying", "verifying", "completed"):
+            claimed = self._write_transfer_progress(
+                item.id,
+                state="classifying",
+                bytes_total=item.bytes_total,
+                bytes_done=bytes_done,
+                local_files=persisted_files,
+                expected_states=("downloaded",),
+            )
+            if claimed is False:
+                return str(
+                    self._read_transfer_status(item.id)["state"]
+                ).casefold()
+            persisted_files = self._publish_local_files(item, persisted_files)
+            recorded = self._write_transfer_progress(
+                item.id,
+                state="classifying",
+                bytes_total=item.bytes_total,
+                bytes_done=bytes_done,
+                local_files=persisted_files,
+                expected_states=("classifying",),
+            )
+            if recorded is False:
+                return str(
+                    self._read_transfer_status(item.id)["state"]
+                ).casefold()
+            current_state = "classifying"
+            for final_state in ("verifying", "completed"):
                 advanced = self._write_transfer_progress(
                     item.id,
                     state=final_state,
                     bytes_total=item.bytes_total,
                     bytes_done=bytes_done,
-                    local_files=local_files,
+                    local_files=persisted_files,
                     expected_states=(current_state,),
                 )
                 if advanced is False:
@@ -971,6 +1097,218 @@ class TorrentEngine:
                 current_state = final_state
             return "completed"
         return state
+
+    @staticmethod
+    def _same_file_content(left: Path, right: Path, expected_size: int) -> bool:
+        try:
+            if (
+                not left.is_file()
+                or not right.is_file()
+                or left.stat().st_size != expected_size
+                or right.stat().st_size != expected_size
+            ):
+                return False
+            try:
+                if left.samefile(right):
+                    return True
+            except OSError:
+                pass
+            digests: list[str] = []
+            for path in (left, right):
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                digests.append(digest.hexdigest())
+            return digests[0] == digests[1]
+        except OSError:
+            return False
+
+    def _publish_destination(
+        self,
+        item: Materialization,
+        selected: MaterializedFile,
+        source: Path,
+    ) -> tuple[Path, str]:
+        destination_root = safe_relative_path(item.destination_path)
+        relative = _relative_to_classified_root(
+            selected.relative_path, destination_root
+        )
+        root = self.settings.media_root.resolve()
+        raw_destination = root.joinpath(
+            *Path(destination_root).parts,
+            *Path(relative).parts,
+        )
+        current = root
+        for component in raw_destination.relative_to(root).parts[:-1]:
+            current = current / component
+            if self._is_link_or_junction(current):
+                raise UnsafeMediaError("destino local contem link ou junction")
+        raw_destination.parent.mkdir(parents=True, exist_ok=True)
+        current = root
+        for component in raw_destination.relative_to(root).parts[:-1]:
+            current = current / component
+            if self._is_link_or_junction(current):
+                raise UnsafeMediaError("destino local contem link ou junction")
+        destination = safe_owned_path(
+            root,
+            *Path(destination_root).parts,
+            *Path(relative).parts,
+        )
+        if self._is_link_or_junction(destination):
+            raise UnsafeMediaError("arquivo local de destino e um link ou junction")
+        if destination.exists() and not self._same_file_content(
+            source, destination, selected.file_size
+        ):
+            leaf = Path(relative).name
+            suffix = "".join(Path(leaf).suffixes)
+            stem = leaf[: -len(suffix)] if suffix else leaf
+            collision_name = f"{stem}~{selected.catalog_file_id}{suffix}"
+            collision_relative = str(
+                Path(relative).with_name(collision_name)
+            ).replace("\\", "/")
+            destination = safe_owned_path(
+                root,
+                *Path(destination_root).parts,
+                *Path(collision_relative).parts,
+            )
+            relative = collision_relative
+            if self._is_link_or_junction(destination):
+                raise UnsafeMediaError("arquivo local de destino e um link ou junction")
+        return destination, relative
+
+    def _validated_publish_source(
+        self,
+        item: Materialization,
+        selected: MaterializedFile,
+    ) -> Path:
+        try:
+            root = self.settings.media_root.resolve(strict=True)
+        except OSError as exc:
+            raise UnsafeMediaError("raiz de midia local indisponivel") from exc
+        lexical = selected.file_path.absolute()
+        try:
+            relative_to_root = lexical.relative_to(root)
+        except ValueError as exc:
+            raise UnsafeMediaError("origem torrent fora da raiz autorizada") from exc
+        if not relative_to_root.parts:
+            raise UnsafeMediaError("origem torrent invalida")
+        current = root
+        try:
+            for component in relative_to_root.parts:
+                current = current / component
+                if self._is_link_or_junction(current):
+                    raise UnsafeMediaError(
+                        "origem torrent contem link ou junction"
+                    )
+            source = lexical.resolve(strict=True)
+            source.relative_to(root)
+            stat = source.stat()
+        except UnsafeMediaError:
+            raise
+        except (OSError, ValueError) as exc:
+            raise UnsafeMediaError("origem torrent local indisponivel") from exc
+        if not source.is_file() or stat.st_size != selected.file_size:
+            raise UnsafeMediaError("origem torrent local invalida")
+        return source
+
+    def _source_is_staging_or_destination(
+        self,
+        item: Materialization,
+        source: Path,
+        destination: Path,
+    ) -> bool:
+        root = self.settings.media_root.resolve(strict=True)
+        staging = safe_owned_path(
+            root, *Path(safe_relative_path(item.download_key)).parts
+        )
+        try:
+            source.relative_to(staging)
+            return True
+        except ValueError:
+            pass
+        try:
+            return destination.exists() and source.samefile(destination)
+        except OSError:
+            return False
+
+    def _publish_local_files(
+        self,
+        item: Materialization,
+        local_files: Sequence[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        if not item.destination_path:
+            raise UnsafeMediaError("destination_path local ausente")
+        manifests = {
+            int(value.get("file_id") or 0): dict(value) for value in local_files
+        }
+        published: list[dict[str, object]] = []
+        for selected in item.files:
+            manifest = manifests.get(selected.catalog_file_id)
+            if manifest is None or manifest.get("complete") is not True:
+                raise UnsafeMediaError("arquivo local ainda nao esta completo")
+            source = self._validated_publish_source(item, selected)
+            destination, relative = self._publish_destination(
+                item, selected, source
+            )
+            if not self._source_is_staging_or_destination(
+                item, source, destination
+            ):
+                raise UnsafeMediaError("origem local fora do staging autorizado")
+            if destination.exists():
+                if not self._same_file_content(source, destination, selected.file_size):
+                    raise UnsafeMediaError("colisao no destino local classificado")
+            else:
+                try:
+                    os.link(source, destination)
+                except OSError as exc:
+                    if exc.errno not in {
+                        errno.EXDEV,
+                        errno.EPERM,
+                        errno.EACCES,
+                        errno.ENOTSUP,
+                        errno.EOPNOTSUPP,
+                    }:
+                        raise
+                    temporary_name: str | None = None
+                    try:
+                        with tempfile.NamedTemporaryFile(
+                            dir=destination.parent,
+                            prefix=f".{destination.name}.",
+                            suffix=".part",
+                            delete=False,
+                        ) as temporary, source.open("rb") as handle:
+                            temporary_name = temporary.name
+                            shutil.copyfileobj(handle, temporary, length=1024 * 1024)
+                            temporary.flush()
+                            os.fsync(temporary.fileno())
+                        temporary_path = Path(temporary_name)
+                        if destination.exists():
+                            if not self._same_file_content(
+                                source, destination, selected.file_size
+                            ):
+                                raise UnsafeMediaError(
+                                    "colisao concorrente no destino local"
+                                )
+                        else:
+                            temporary_path.replace(destination)
+                    finally:
+                        if temporary_name:
+                            Path(temporary_name).unlink(missing_ok=True)
+            if not self._same_file_content(source, destination, selected.file_size):
+                raise UnsafeMediaError("publicacao local diverge do torrent")
+            published.append(
+                {
+                    **manifest,
+                    "path": manifest.get("path") or selected.relative_path,
+                    "relative_path": relative,
+                    "source_path": str(source),
+                    "local_path": str(destination),
+                    "bytes_done": selected.file_size,
+                    "complete": True,
+                }
+            )
+        return published
 
     def _refresh_materialization(self, job_id: str) -> dict[str, Any]:
         with self.lock:
@@ -1112,7 +1450,13 @@ class TorrentEngine:
             self._release_materialization(job_id)
         else:
             status = self._read_transfer_status(job_id)
-            if status["state"] not in TERMINAL_TRANSFER_STATES | {"downloaded"}:
+            protected_local_states = (
+                {"downloaded", "classifying", "verifying"}
+                if status.get("target") == "local"
+                and status.get("source_site") in {"filecr", "1337x"}
+                else {"downloaded"}
+            )
+            if status["state"] not in TERMINAL_TRANSFER_STATES | protected_local_states:
                 self._cancel_transfer_job(job_id)
         return self._read_transfer_status(job_id)
 

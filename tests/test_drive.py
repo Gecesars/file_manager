@@ -76,6 +76,10 @@ def test_remote_group_prefix_is_not_duplicated_under_destination(tmp_path: Path)
     assert relative_to_destination_group(
         ["Series/Dexter/episode.mkv"], category_destination
     ) == ["Dexter/episode.mkv"]
+    # Coincidencia no meio/fim nao autoriza apagar a arvore original.
+    assert relative_to_destination_group(
+        ["Show/Season 1/episode.mkv"], tmp_path / "video" / "Season 1"
+    ) == ["Show/Season 1/episode.mkv"]
 
 
 def test_grouping_preserves_category_and_collects_nested_series():
@@ -630,6 +634,14 @@ def test_rest_helpers_create_folder_idempotently_with_pregenerated_id():
     assert not session.responses
 
 
+@pytest.mark.parametrize("path", ["/video/Filmes", "C:/video/Filmes", "../Filmes"])
+def test_ensure_folder_path_rejects_non_relative_roots_before_drive_request(path: str):
+    client, session = drive_client([])
+    with pytest.raises(drive_service.UnsafeMediaError):
+        client.ensure_folder_path("parent-folder-12345", path)
+    assert session.calls == []
+
+
 def test_existing_folder_is_patched_with_management_identity():
     folder_id = "existing-folder-12345"
     client, session = drive_client(
@@ -866,10 +878,12 @@ class FakeTransferClient:
     def __init__(self):
         self.uploads = []
         self.downloads = []
+        self.folders = []
         self.metadata = {}
         self.metadata_calls = []
 
     def ensure_folder_path(self, root_id, path):
+        self.folders.append((root_id, path))
         return "managed-folder-12345"
 
     def upload_resumable(self, source, parent_id, **kwargs):
@@ -968,6 +982,65 @@ def test_worker_claims_downloaded_upload_job_and_publishes_manifest(tmp_path: Pa
     assert final["bytes_done"] == len(b"episode") + len(b"notes")
     assert final["drive_files"][0]["drive_file_id"] == "worker-upload-12345"
     assert store.sha256s == [(41, hashlib.sha256(b"episode").hexdigest())]
+
+
+def test_torrent_upload_keeps_classified_root_once_and_original_subtree(
+    tmp_path: Path,
+):
+    episode = tmp_path / "episode.mkv"
+    subtitle = tmp_path / "episode.srt"
+    episode.write_bytes(b"episode")
+    subtitle.write_bytes(b"subtitle")
+    job = {
+        "id": "job-upload-tree",
+        "source_site": "1337x",
+        "infohash": "e" * 40,
+        "target": "gdrive",
+        "state": "downloaded",
+        "destination_path": "video/Series/Dexter",
+        "local_files": [
+            {
+                "file_id": 61,
+                "local_path": str(episode),
+                "relative_path": (
+                    "video/Series/Dexter/Season 01/episode.mkv"
+                ),
+            },
+            {
+                "file_id": 62,
+                "local_path": str(subtitle),
+                "relative_path": "Series/Dexter/Subtitles/episode.srt",
+            },
+        ],
+        "drive_files": [],
+        "upload_state": {},
+    }
+    store = FakeStore(upload=job)
+    client = FakeTransferClient()
+    worker = DriveTransferWorker(
+        worker_settings(tmp_path), client, store=store, allowed_local_roots=(tmp_path,)
+    )
+
+    assert worker.run_once("gdrive")["state"] == "completed"
+    final = next(
+        update
+        for _, update in reversed(store.updates)
+        if update.get("state") == "completed"
+    )
+    by_id = {
+        entry["drive_file_id"]: entry["relative_path"]
+        for entry in final["drive_files"]
+    }
+    assert set(by_id.values()) == {
+        "Season 01/episode.mkv",
+        "Subtitles/episode.srt",
+    }
+    assert client.folders == [
+        ("root-folder-12345", "video/Series/Dexter"),
+        ("managed-folder-12345", "Season 01"),
+        ("managed-folder-12345", "Subtitles"),
+    ]
+    assert all("video/Series/Dexter" not in path for path in by_id.values())
 
 
 def test_upload_worker_resumes_stale_uploading_job_idempotently(tmp_path: Path):
@@ -1154,6 +1227,113 @@ def test_worker_claims_local_job_and_publishes_downloaded_files(tmp_path: Path):
     assert Path(final["local_files"][0]["local_path"]).read_bytes() == payload
 
 
+def test_drive_download_keeps_classified_root_once_and_original_subtree(
+    tmp_path: Path,
+):
+    payload = b"remote-data"
+    destination = tmp_path / "video" / "Series" / "Dexter"
+    job = {
+        "id": "job-download-tree",
+        "source_site": "gdrive",
+        "target": "local",
+        "state": "queued",
+        "destination_path": str(destination),
+        "drive_files": [
+            {
+                "drive_file_id": "remote-episode-12345",
+                "relative_path": (
+                    "video/Series/Dexter/Season 01/episode.bin"
+                ),
+                "size": len(payload),
+                "md5_checksum": hashlib.md5(
+                    payload, usedforsecurity=False
+                ).hexdigest(),
+                "sha256_checksum": hashlib.sha256(payload).hexdigest(),
+            },
+            {
+                "drive_file_id": "remote-subtitle-12345",
+                "relative_path": "Series/Dexter/Subtitles/episode.srt",
+                "size": len(payload),
+                "md5_checksum": hashlib.md5(
+                    payload, usedforsecurity=False
+                ).hexdigest(),
+                "sha256_checksum": hashlib.sha256(payload).hexdigest(),
+            },
+        ],
+        "local_files": [],
+    }
+    store = FakeStore(download=job)
+    client = FakeTransferClient()
+    worker = DriveTransferWorker(
+        worker_settings(tmp_path), client, store=store, allowed_local_roots=(tmp_path,)
+    )
+
+    assert worker.run_once("local")["state"] == "completed"
+    final = next(
+        update
+        for _, update in reversed(store.updates)
+        if update.get("state") == "completed"
+    )
+    assert {Path(item["local_path"]) for item in final["local_files"]} == {
+        destination / "Season 01" / "episode.bin",
+        destination / "Subtitles" / "episode.srt",
+    }
+    assert not (destination / "video" / "Series" / "Dexter").exists()
+    assert not (destination / "Series" / "Dexter").exists()
+
+
+def test_drive_download_uses_stable_suffix_for_unrelated_local_collision(
+    tmp_path: Path,
+):
+    payload = b"remote-data"
+    destination = tmp_path / "video" / "Series" / "Dexter"
+    occupied = destination / "Season 01" / "episode.bin"
+    occupied.parent.mkdir(parents=True)
+    occupied.write_bytes(b"unrelated")
+
+    def run(job_id: str) -> Path:
+        job = {
+            "id": job_id,
+            "source_site": "gdrive",
+            "target": "local",
+            "state": "queued",
+            "destination_path": str(destination),
+            "drive_files": [
+                {
+                    "drive_file_id": "remote-collision-12345",
+                    "relative_path": "Series/Dexter/Season 01/episode.bin",
+                    "size": len(payload),
+                    "md5_checksum": hashlib.md5(
+                        payload, usedforsecurity=False
+                    ).hexdigest(),
+                    "sha256_checksum": hashlib.sha256(payload).hexdigest(),
+                }
+            ],
+            "local_files": [],
+        }
+        store = FakeStore(download=job)
+        worker = DriveTransferWorker(
+            worker_settings(tmp_path),
+            FakeTransferClient(),
+            store=store,
+            allowed_local_roots=(tmp_path,),
+        )
+        assert worker.run_once("local")["state"] == "completed"
+        final = next(
+            update
+            for _, update in reversed(store.updates)
+            if update.get("state") == "completed"
+        )
+        return Path(final["local_files"][0]["local_path"])
+
+    first = run("job-local-collision-1")
+    second = run("job-local-collision-2")
+    digest = hashlib.sha256(b"gdrive:remote-collision-12345").hexdigest()[:10]
+    assert first == second == occupied.with_name(f"episode--{digest}.bin")
+    assert occupied.read_bytes() == b"unrelated"
+    assert first.read_bytes() == payload
+
+
 @pytest.mark.parametrize(
     ("state", "expected_states", "needs_download"),
     [
@@ -1241,3 +1421,33 @@ def test_upload_source_reparse_point_is_rejected_without_touching_drive(
     )
     assert worker.run_once("gdrive")["state"] == "failed"
     assert client.uploads == []
+
+
+def test_upload_manifest_absolute_relative_path_is_rejected_before_drive_api(
+    tmp_path: Path,
+):
+    source = tmp_path / "episode.mp4"
+    source.write_bytes(b"video")
+    job = {
+        "id": "job-upload-absolute-relative",
+        "source_site": "1337x",
+        "infohash": "f" * 40,
+        "target": "gdrive",
+        "state": "classifying",
+        "destination_path": "video/Series/Safe",
+        "local_files": [
+            {
+                "local_path": str(source),
+                "relative_path": "/video/Series/Safe/episode.mp4",
+            }
+        ],
+        "drive_files": [],
+        "upload_state": {},
+    }
+    store = FakeStore(upload=job)
+    client = FakeTransferClient()
+    worker = DriveTransferWorker(
+        worker_settings(tmp_path), client, store=store, allowed_local_roots=(tmp_path,)
+    )
+    assert worker.run_once("gdrive")["state"] == "failed"
+    assert client.folders == [] and client.uploads == []

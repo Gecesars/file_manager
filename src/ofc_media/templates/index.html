@@ -25,8 +25,8 @@
     <section class="hero">
       <div>
         <span class="eyebrow">Centro de operações · v{{ version }}</span>
-        <h1>Três áreas.<br>Um só acervo.</h1>
-        <p>Explore o que já está no Google Drive, acompanhe os arquivos disponíveis localmente e descubra o inventário de torrents sem interromper os coletores.</p>
+        <h1>Quatro fontes.<br>Um só acervo.</h1>
+        <p>Escolha uma fonte, filtre por tipo e acompanhe com clareza o que está no Google Drive, na área local ou nos inventários FileCR e 1337x.</p>
       </div>
       <div class="hero-actions">
         <button class="primary hero-action" data-open-all type="button">Explorar tudo</button>
@@ -36,27 +36,32 @@
 
     <section class="domains" aria-labelledby="domains-title">
       <div class="domains-heading">
-        <div><span class="eyebrow">Mapa do acervo</span><h2 id="domains-title">Escolha onde começar</h2></div>
-        <p>Torrent indica a origem do inventário; Drive e Local indicam onde existe uma cópia. O mesmo arquivo pode ocupar mais de uma área.</p>
+        <div><span class="eyebrow">Mapa do acervo</span><h2 id="domains-title">Selecione uma fonte</h2></div>
+        <p>Cada card identifica origem, status e localização. FileCR e 1337x são inventários; Drive e Local indicam onde há uma cópia utilizável.</p>
       </div>
       <div class="domain-grid">
-        <article class="domain-card domain-drive">
+        <article class="domain-card domain-drive" data-source-card="gdrive">
           <div class="domain-card-head">
             <span class="domain-glyph" aria-hidden="true">
               <svg viewBox="0 0 24 24"><path d="M7.7 17.5h9.9a4 4 0 0 0 .5-7.97A6.25 6.25 0 0 0 6.17 8.2 4.7 4.7 0 0 0 7.7 17.5Z"/></svg>
             </span>
-            <span class="domain-health" data-domain-health="gdrive">Verificando serviço…</span>
+            <div class="domain-card-controls">
+              <span class="domain-health" data-domain-health="gdrive">Verificando serviço…</span>
+              <button class="domain-select" data-select-source="gdrive" type="button" aria-pressed="false">Selecionar</button>
+            </div>
           </div>
           <div class="domain-copy">
             <span class="domain-kicker">Remoto</span>
             <h3>Google Drive</h3>
-            <p>Conteúdo já publicado, pronto para explorar, reproduzir ou baixar para a área local.</p>
+            <p>Conteúdo publicado, pronto para explorar, reproduzir ou baixar mantendo sua estrutura relativa.</p>
           </div>
+          <div class="domain-location"><span>Localização</span><strong data-domain-location="gdrive">Google Drive</strong></div>
           <div class="domain-metrics" aria-label="Resumo do Google Drive">
             <div><strong data-domain-metric="gdrive-files">—</strong><span>arquivos</span></div>
             <div><strong data-domain-metric="gdrive-bytes">—</strong><span>armazenados</span></div>
             <div><strong data-domain-metric="gdrive-titles">—</strong><span>títulos</span></div>
           </div>
+          <div class="domain-types" data-domain-types="gdrive" aria-label="Tipos no Google Drive"><span class="type-pill muted">Tipos indisponíveis</span></div>
           <p class="domain-state" data-domain-state="gdrive">Carregando inventário…</p>
           <div class="domain-actions">
             <button class="domain-primary" data-open-domain="gdrive" type="button">Explorar Drive</button>
@@ -64,49 +69,87 @@
           </div>
         </article>
 
-        <article class="domain-card domain-local">
+        <article class="domain-card domain-filecr" data-source-card="filecr">
           <div class="domain-card-head">
             <span class="domain-glyph" aria-hidden="true">
               <svg viewBox="0 0 24 24"><path d="M5 4.5h14a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-11a2 2 0 0 1 2-2Zm0 10v3h14v-3H5Zm11.5 1a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Z"/></svg>
             </span>
-            <span class="domain-health" data-domain-health="local">Verificando serviço…</span>
+            <div class="domain-card-controls">
+              <span class="domain-health" data-domain-health="filecr">Verificando serviço…</span>
+              <button class="domain-select" data-select-source="filecr" type="button" aria-pressed="false">Selecionar</button>
+            </div>
+          </div>
+          <div class="domain-copy">
+            <span class="domain-kicker">Inventário torrent</span>
+            <h3>FileCR</h3>
+            <p>Software, documentos e outros pacotes catalogados, disponíveis para download controlado.</p>
+          </div>
+          <div class="domain-location"><span>Localização</span><strong data-domain-location="filecr">Inventário FileCR</strong></div>
+          <div class="domain-metrics" aria-label="Resumo do FileCR">
+            <div><strong data-domain-metric="filecr-files">—</strong><span>arquivos</span></div>
+            <div><strong data-domain-metric="filecr-bytes">—</strong><span>catalogados</span></div>
+            <div><strong data-domain-metric="filecr-titles">—</strong><span>torrents</span></div>
+          </div>
+          <div class="domain-types" data-domain-types="filecr" aria-label="Tipos no FileCR"><span class="type-pill muted">Tipos indisponíveis</span></div>
+          <p class="domain-state" data-domain-state="filecr">Carregando inventário…</p>
+          <div class="domain-actions">
+            <button class="domain-primary" data-open-domain="filecr" type="button">Explorar FileCR</button>
+          </div>
+        </article>
+
+        <article class="domain-card domain-1337x" data-source-card="1337x">
+          <div class="domain-card-head">
+            <span class="domain-glyph" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M12 2.5a1 1 0 0 1 1 1v8.59l2.3-2.3a1 1 0 1 1 1.4 1.42l-4 4a1 1 0 0 1-1.4 0l-4-4a1 1 0 1 1 1.4-1.42l2.3 2.3V3.5a1 1 0 0 1 1-1Zm-7 14a1 1 0 0 1 1 1v1h12v-1a1 1 0 1 1 2 0v2a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-2a1 1 0 0 1 1-1Z"/></svg>
+            </span>
+            <div class="domain-card-controls">
+              <span class="domain-health" data-domain-health="1337x">Verificando serviço…</span>
+              <button class="domain-select" data-select-source="1337x" type="button" aria-pressed="false">Selecionar</button>
+            </div>
+          </div>
+          <div class="domain-copy">
+            <span class="domain-kicker">Inventário torrent</span>
+            <h3>1337x</h3>
+            <p>Mídia e outros conteúdos descobertos pelo coletor, sem exigir download para explorar.</p>
+          </div>
+          <div class="domain-location"><span>Localização</span><strong data-domain-location="1337x">Inventário 1337x</strong></div>
+          <div class="domain-metrics" aria-label="Resumo do 1337x">
+            <div><strong data-domain-metric="1337x-files">—</strong><span>arquivos</span></div>
+            <div><strong data-domain-metric="1337x-bytes">—</strong><span>catalogados</span></div>
+            <div><strong data-domain-metric="1337x-titles">—</strong><span>torrents</span></div>
+          </div>
+          <div class="domain-types" data-domain-types="1337x" aria-label="Tipos no 1337x"><span class="type-pill muted">Tipos indisponíveis</span></div>
+          <p class="domain-state" data-domain-state="1337x">Carregando inventário…</p>
+          <div class="domain-actions">
+            <button class="domain-primary" data-open-domain="1337x" type="button">Explorar 1337x</button>
+          </div>
+        </article>
+
+        <article class="domain-card domain-local" data-source-card="local">
+          <div class="domain-card-head">
+            <span class="domain-glyph" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M5 4.5h14a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-11a2 2 0 0 1 2-2Zm0 10v3h14v-3H5Zm11.5 1a.75.75 0 1 0 0 1.5.75.75 0 0 0 0-1.5Z"/></svg>
+            </span>
+            <div class="domain-card-controls">
+              <span class="domain-health" data-domain-health="local">Verificando serviço…</span>
+              <button class="domain-select" data-select-source="local" type="button" aria-pressed="false">Selecionar</button>
+            </div>
           </div>
           <div class="domain-copy">
             <span class="domain-kicker">Nesta máquina</span>
             <h3>Arquivos locais</h3>
-            <p>Downloads concluídos e validados, disponíveis para uso local ou publicação classificada no Drive.</p>
+            <p>Downloads concluídos e validados, prontos para uso ou publicação classificada no Drive.</p>
           </div>
+          <div class="domain-location"><span>Localização</span><strong data-domain-location="local">Armazenamento local</strong></div>
           <div class="domain-metrics" aria-label="Resumo dos arquivos locais">
             <div><strong data-domain-metric="local-files">—</strong><span>arquivos</span></div>
             <div><strong data-domain-metric="local-bytes">—</strong><span>em disco</span></div>
             <div><strong data-domain-metric="local-titles">—</strong><span>títulos</span></div>
           </div>
+          <div class="domain-types" data-domain-types="local" aria-label="Tipos na área local"><span class="type-pill muted">Tipos indisponíveis</span></div>
           <p class="domain-state" data-domain-state="local">Carregando inventário…</p>
           <div class="domain-actions">
             <button class="domain-primary" data-open-domain="local" type="button">Explorar locais</button>
-          </div>
-        </article>
-
-        <article class="domain-card domain-torrent">
-          <div class="domain-card-head">
-            <span class="domain-glyph" aria-hidden="true">
-              <svg viewBox="0 0 24 24"><path d="M12 2.5a1 1 0 0 1 1 1v8.59l2.3-2.3a1 1 0 1 1 1.4 1.42l-4 4a1 1 0 0 1-1.4 0l-4-4a1 1 0 1 1 1.4-1.42l2.3 2.3V3.5a1 1 0 0 1 1-1Zm-7 14a1 1 0 0 1 1 1v1h12v-1a1 1 0 1 1 2 0v2a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-2a1 1 0 0 1 1-1Z"/></svg>
-            </span>
-            <span class="domain-health" data-domain-health="torrent">Verificando serviço…</span>
-          </div>
-          <div class="domain-copy">
-            <span class="domain-kicker">Inventário</span>
-            <h3>Torrents</h3>
-            <p>Metadados FileCR e 1337x disponíveis para seleção, download controlado e envio posterior ao Drive.</p>
-          </div>
-          <div class="domain-metrics" aria-label="Resumo do inventário de torrents">
-            <div><strong data-domain-metric="torrent-files">—</strong><span>arquivos</span></div>
-            <div><strong data-domain-metric="torrent-bytes">—</strong><span>catalogados</span></div>
-            <div><strong data-domain-metric="torrent-titles">—</strong><span>torrents</span></div>
-          </div>
-          <p class="domain-state" data-domain-state="torrent">Carregando inventário…</p>
-          <div class="domain-actions">
-            <button class="domain-primary" data-open-domain="torrent" type="button">Explorar torrents</button>
           </div>
         </article>
       </div>
@@ -145,17 +188,43 @@
         <div><span class="eyebrow">Explorador</span><h2 data-files-heading>Todos os arquivos</h2><p class="section-context" data-files-context>Drive, área local e inventário torrent em uma única busca.</p></div>
         <span class="result-count" data-files-total aria-live="polite"></span>
       </div>
+      <div class="type-filter" aria-labelledby="type-filter-title">
+        <div class="type-filter-heading"><strong id="type-filter-title">Selecionar por tipo</strong><span>O agrupamento abaixo controla os itens visíveis.</span></div>
+        <div class="type-filter-options" data-type-filters role="group" aria-label="Tipos de arquivo">
+          <button class="type-filter-button active" data-type-filter="" type="button" aria-pressed="true">Todos</button>
+          <button class="type-filter-button" data-type-filter="video" type="button" aria-pressed="false">Vídeo</button>
+          <button class="type-filter-button" data-type-filter="audio" type="button" aria-pressed="false">Áudio</button>
+          <button class="type-filter-button" data-type-filter="subtitle" type="button" aria-pressed="false">Legenda</button>
+          <button class="type-filter-button" data-type-filter="image" type="button" aria-pressed="false">Imagem</button>
+          <button class="type-filter-button" data-type-filter="document" type="button" aria-pressed="false">Documento</button>
+          <button class="type-filter-button" data-type-filter="archive" type="button" aria-pressed="false">Compactado</button>
+          <button class="type-filter-button" data-type-filter="software" type="button" aria-pressed="false">Software</button>
+          <button class="type-filter-button" data-type-filter="dataset" type="button" aria-pressed="false">Dataset</button>
+          <button class="type-filter-button" data-type-filter="other" type="button" aria-pressed="false">Outros</button>
+        </div>
+      </div>
       <div class="toolbar files-toolbar">
         <label class="search-field"><span class="sr-only">Pesquisar arquivo</span><input data-files-query type="search" placeholder="Nome, caminho, título ou hash"></label>
-        <select data-files-site aria-label="Origem do inventário"><option value="">Todas as origens</option><option value="gdrive">Google Drive</option><option value="torrent">Todos os torrents</option><option value="1337x">Torrent · 1337x</option><option value="filecr">Torrent · FileCR</option></select>
+        <select data-files-site aria-label="Fonte"><option value="">Todas as fontes</option><option value="gdrive">Google Drive</option><option value="filecr">FileCR</option><option value="1337x">1337x</option><option value="local">Local</option><option value="torrent">FileCR + 1337x</option></select>
         <select data-kind aria-label="Tipo"><option value="">Todos os tipos</option><option value="video">Vídeo</option><option value="audio">Áudio</option><option value="subtitle">Legenda</option><option value="image">Imagem</option><option value="document">Documento</option><option value="archive">Arquivo compactado</option><option value="software">Software</option><option value="dataset">Dataset</option><option value="other">Outros</option></select>
+        <select data-files-status aria-label="Status"><option value="">Todos os status</option></select>
         <select data-presence aria-label="Presença"><option value="">Qualquer presença</option><option value="gdrive">Já está no Drive</option><option value="not_gdrive">Fora do Drive</option><option value="local">Disponível localmente</option><option value="both">Local e Drive</option><option value="missing">Sem cópia disponível</option><option value="exact">Correspondência exata</option><option value="possible">Possível duplicata</option></select>
+        <select data-group-by aria-label="Agrupar por"><option value="type">Agrupar por tipo</option><option value="source">Agrupar por fonte</option><option value="status">Agrupar por status</option><option value="presence">Agrupar por presença</option><option value="location">Agrupar por localização</option></select>
         <button class="primary" data-files-search type="button">Pesquisar</button>
+      </div>
+      <div class="file-groups" data-file-groups aria-label="Resumo dos grupos"></div>
+      <div class="bulk-bar" data-bulk-bar hidden>
+        <div><strong data-selected-count aria-live="polite">0 arquivos selecionados</strong><span>A seleção considera somente os itens visíveis e filtrados. A árvore de pastas será preservada em cada raiz classificada.</span></div>
+        <div class="bulk-actions">
+          <button class="secondary" data-clear-selection type="button">Limpar seleção</button>
+          <button class="secondary" data-bulk-local type="button">Manter no Local</button>
+          <button class="primary" data-bulk-drive type="button">Disponibilizar no Drive</button>
+        </div>
       </div>
       <div class="table-shell" role="region" aria-label="Tabela de arquivos" tabindex="0">
         <table>
           <caption class="sr-only">Arquivos encontrados no inventário unificado</caption>
-          <thead><tr><th>Arquivo</th><th>Tipo</th><th>Origem</th><th>Tamanho</th><th>Onde está</th><th><span class="sr-only">Ações</span></th></tr></thead>
+          <thead><tr><th class="select-column"><label><input data-select-visible type="checkbox"><span class="sr-only">Selecionar itens visíveis e filtrados</span></label></th><th>Arquivo</th><th>Tipo</th><th>Origem</th><th>Status</th><th>Localização</th><th>Tamanho</th><th><span class="sr-only">Ações</span></th></tr></thead>
           <tbody data-files-body></tbody>
         </table>
       </div>

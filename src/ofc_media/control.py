@@ -296,13 +296,19 @@ class ControlPlane:
         presence: str | None,
         page: int | str,
         per_page: int | str,
+        source: str | None = None,
+        status: str | None = None,
+        group_by: str | None = None,
     ) -> dict[str, Any]:
         with connection(self.settings) as database:
             selected = InventoryService(database).explorer(
                 q=q,
                 site=site,
+                source=source,
                 kind=kind,
                 presence=presence,
+                status=status,
+                group_by=group_by,
                 page=page,  # type: ignore[arg-type]
                 page_size=per_page,  # type: ignore[arg-type]
             )
@@ -386,7 +392,11 @@ class ControlPlane:
             kinds = {str(row.get("file_kind") or "other") for row in files}
             if not kinds.issubset(FILE_KINDS):
                 raise UnsafeMediaError("tipo de arquivo inventariado invalido")
-            destination_kind = next(iter(kinds)) if len(kinds) == 1 else "other"
+            if len(kinds) != 1:
+                raise ValueError(
+                    "selecione arquivos de um unico tipo; agrupe a transferencia por tipo"
+                )
+            destination_kind = next(iter(kinds))
             category = str(torrent.get("category") or "sem-categoria")
             title = str(
                 torrent.get("title")
@@ -397,7 +407,7 @@ class ControlPlane:
                 destination_kind, category, title
             )
             bytes_total = sum(int(row.get("size") or 0) for row in files)
-            if bytes_total > LARGE_TRANSFER_BYTES and confirm_large is not True:
+            if bytes_total >= LARGE_TRANSFER_BYTES and confirm_large is not True:
                 raise LargeTransferConfirmationRequired(bytes_total)
             drive_files: list[dict[str, Any]] = []
             if selected_site == "gdrive":
@@ -1023,8 +1033,11 @@ def create_app() -> Flask:
             result = plane.files(
                 q=request.args.get("q"),
                 site=request.args.get("site"),
+                source=request.args.get("source"),
                 kind=request.args.get("kind"),
                 presence=request.args.get("presence"),
+                status=request.args.get("status"),
+                group_by=request.args.get("group_by"),
                 page=request.args.get("page", "1"),
                 per_page=request.args.get("per_page", "50"),
             )

@@ -10,6 +10,7 @@ const state = {
   timer: null,
   transferTimer: null,
   transferRequest: 0,
+  filesRequest: 0,
   hls: null,
   metrics: null,
   policyPaused: false,
@@ -21,6 +22,9 @@ const state = {
   failedStreamUrl: null,
   notice: "",
   pendingTransfers: new Set(),
+  filesItems: [],
+  selectedFiles: new Map(),
+  selectedSource: "",
 };
 
 const video = $("[data-video]");
@@ -90,9 +94,16 @@ function button(label, className, handler) {
 
 function sourceLabel(site) {
   if (site === "gdrive") return "Google Drive";
+  if (site === "local") return "Local";
   if (site === "torrent") return "Torrents";
-  return site === "1337x" ? "Torrent · 1337x" : "Torrent · FileCR";
+  if (site === "1337x") return "1337x";
+  if (site === "filecr") return "FileCR";
+  return site || "Origem desconhecida";
 }
+
+function sourceOf(item) { return item.source || item.site || item.origin || ""; }
+
+function kindOf(item) { return item.file_kind || item.type || "other"; }
 
 function kindLabel(kind) {
   return ({
@@ -103,13 +114,75 @@ function kindLabel(kind) {
 }
 
 function presenceLabel(item) {
+  if (item.presence_confidence === "possible") return ["possible", "Possível no Drive"];
+  const locations = Array.isArray(item.locations)
+    ? item.locations.map((value) => typeof value === "string" ? value : value?.kind || value?.source || value?.location)
+    : Object.keys(item.locations || {}).filter((key) => item.locations[key]);
+  const onDrive = locations.includes("gdrive") || locations.includes("drive");
+  const local = locations.includes("local");
+  if (onDrive && local) return ["exact", "Local e Drive"];
+  if (onDrive) return ["exact", "No Drive"];
+  if (local) return ["local", "Somente local"];
   if (item.presence === "both") return ["exact", "Local e Drive"];
-  if (item.gdrive_present || item.site === "gdrive") {
+  if (item.gdrive_present || sourceOf(item) === "gdrive") {
     if (item.presence_confidence === "possible") return ["possible", "Possível no Drive"];
     return ["exact", "No Drive"];
   }
   if (item.presence === "local") return ["local", "Somente local"];
   return ["missing", "Somente torrent"];
+}
+
+function statusLabel(value) {
+  const normalized = String(value || "cataloged").toLowerCase();
+  return ({
+    available: "Disponível", ready: "Disponível", busy: "Em atividade", cataloged: "Catalogado",
+    possible: "Possível duplicata",
+    indexed: "Catalogado", local: "Disponível localmente", remote: "No Drive",
+    queued: "Na fila", downloading: "Baixando", uploading: "Enviando",
+    verifying: "Verificando", completed: "Concluído", failed: "Falhou",
+    unavailable: "Indisponível", empty: "Sem itens", online: "Online",
+  })[normalized] || String(value || "Catalogado");
+}
+
+function statusClass(value) {
+  const normalized = String(value || "cataloged").toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+  if (normalized === "empty") return "empty";
+  if (["failed", "unavailable", "offline", "error"].includes(normalized)) return "failed";
+  if (["busy", "possible", "queued", "downloading", "uploading", "verifying", "syncing"].includes(normalized)) return "active";
+  if (["available", "ready", "completed", "online", "local", "remote"].includes(normalized)) return "ready";
+  return "cataloged";
+}
+
+function locationText(item) {
+  if (Array.isArray(item.locations) && item.locations.length) {
+    return item.locations.map((value) => {
+      if (typeof value === "string") return sourceLabel(value === "drive" ? "gdrive" : value);
+      const source = value?.kind || value?.source || value?.location_kind;
+      const relative = value?.path || value?.location;
+      const path = value?.destination_path && relative
+        ? `${value.destination_path.replace(/[\\/]+$/, "")}/${String(relative).replace(/^[\\/]+/, "")}`
+        : relative;
+      const label = value?.label || (
+        source === "gdrive" && item.presence_confidence === "possible"
+          ? "Possível no Drive"
+          : sourceLabel(source)
+      );
+      return path ? `${label}: ${path}` : label;
+    }).filter(Boolean).join(" + ");
+  }
+  if (item.locations && typeof item.locations === "object") {
+    const labels = Object.entries(item.locations).filter(([, value]) => value).map(([key, value]) => {
+      const name = sourceLabel(key === "drive" ? "gdrive" : key);
+      const path = typeof value === "string" ? value : value?.path || value?.location || value?.label;
+      return path ? `${name}: ${path}` : name;
+    });
+    if (labels.length) return labels.join(" + ");
+  }
+  if (typeof item.location === "string" && item.location) return item.location;
+  if (item.location?.label) return item.location.label;
+  if (item.location?.path) return item.location.path;
+  const [presenceClass, presenceText] = presenceLabel(item);
+  return presenceClass === "missing" ? "Somente no inventário" : presenceText;
 }
 
 function renderPagination(name, data, loadPage) {
@@ -162,6 +235,7 @@ function showError(error) { toast(error?.message || String(error), true); }
 
 function setDomainHealth(domain, healthy, readyText, failedText) {
   const element = $(`[data-domain-health="${domain}"]`);
+  if (!element) return;
   element.textContent = healthy ? readyText : failedText;
   element.classList.toggle("ok", Boolean(healthy));
   element.classList.toggle("bad", !healthy);
@@ -169,10 +243,12 @@ function setDomainHealth(domain, healthy, readyText, failedText) {
 
 function setDomainInventoryState(domain, files, readyText, emptyText) {
   const element = $(`[data-domain-state="${domain}"]`);
+  if (!element) return;
   const available = Number(files || 0) > 0;
   element.textContent = available ? readyText : emptyText;
   element.classList.toggle("ready", available);
   element.classList.toggle("empty-state", !available);
+  element.classList.remove("active");
 }
 
 function domainSnapshot(data, name, fallback = {}) {
@@ -181,6 +257,12 @@ function domainSnapshot(data, name, fallback = {}) {
     files: current.files ?? fallback.files,
     bytes: current.bytes ?? fallback.bytes,
     titles: current.titles ?? fallback.titles,
+    types: current.types ?? fallback.types,
+    location: current.location ?? fallback.location,
+    location_kind: current.location_kind ?? fallback.location_kind,
+    status: current.status ?? fallback.status,
+    selectable: current.selectable ?? fallback.selectable ?? true,
+    sources: current.sources ?? fallback.sources,
   };
 }
 
@@ -188,6 +270,98 @@ function renderDomain(name, snapshot) {
   $(`[data-domain-metric="${name}-files"]`).textContent = snapshot.files == null ? "—" : formatNumber(snapshot.files);
   $(`[data-domain-metric="${name}-bytes"]`).textContent = optionalBytes(snapshot.bytes);
   $(`[data-domain-metric="${name}-titles"]`).textContent = snapshot.titles == null ? "—" : formatNumber(snapshot.titles);
+  const location = $(`[data-domain-location="${name}"]`);
+  if (location && snapshot.location) location.textContent = snapshot.location;
+  renderDomainTypes(name, snapshot.types);
+  const select = $(`[data-select-source="${name}"]`);
+  if (select) {
+    select.disabled = snapshot.selectable === false;
+    select.textContent = snapshot.selectable === false
+      ? "Indisponível"
+      : (state.selectedSource === name ? "Selecionado" : "Selecionar");
+  }
+}
+
+function typeEntries(types) {
+  if (Array.isArray(types)) return types.map((entry) => {
+    if (typeof entry === "string") return { value: entry, count: null };
+    return { value: entry.value || entry.type || entry.key || entry.name, count: entry.count ?? entry.files ?? entry.total };
+  }).filter((entry) => entry.value);
+  if (types && typeof types === "object") return Object.entries(types).map(([value, count]) => ({
+    value,
+    count: typeof count === "object" ? count.count ?? count.files ?? count.total : count,
+  }));
+  return [];
+}
+
+function renderDomainTypes(name, types) {
+  const target = $(`[data-domain-types="${name}"]`);
+  if (!target) return;
+  const entries = typeEntries(types)
+    .sort((left, right) => Number(right.count || 0) - Number(left.count || 0))
+    .slice(0, 4);
+  target.replaceChildren();
+  if (!entries.length) {
+    const empty = document.createElement("span");
+    empty.className = "type-pill muted";
+    empty.textContent = "Tipos ainda não resumidos";
+    target.append(empty);
+    return;
+  }
+  entries.forEach((entry) => {
+    const item = document.createElement("span");
+    item.className = "type-pill";
+    item.textContent = `${kindLabel(entry.value)}${entry.count == null ? "" : ` · ${formatNumber(entry.count)}`}`;
+    target.append(item);
+  });
+}
+
+function selectSource(source, openExplorer = false) {
+  state.selectedSource = state.selectedSource === source && !openExplorer ? "" : source;
+  $$('[data-source-card]').forEach((card) => {
+    const selected = card.dataset.sourceCard === state.selectedSource;
+    card.classList.toggle("selected", selected);
+    card.dataset.selected = String(selected);
+  });
+  $$('[data-select-source]').forEach((control) => {
+    const selected = control.dataset.selectSource === state.selectedSource;
+    control.setAttribute("aria-pressed", String(selected));
+    if (!control.disabled) control.textContent = selected ? "Selecionado" : "Selecionar";
+  });
+  if (openExplorer) openFilesDomain(source);
+}
+
+function normalizedFilterEntries(values) {
+  if (Array.isArray(values)) return values.map((entry) => {
+    if (typeof entry === "string") return { value: entry, label: statusLabel(entry), count: null };
+    const value = entry.value || entry.status || entry.key || entry.name;
+    return { value, label: entry.label || statusLabel(value), count: entry.count ?? entry.total };
+  }).filter((entry) => entry.value);
+  if (values && typeof values === "object") return Object.entries(values).map(([value, entry]) => ({
+    value,
+    label: typeof entry === "object" && entry.label ? entry.label : statusLabel(value),
+    count: typeof entry === "object" ? entry.count ?? entry.total : entry,
+  }));
+  return [];
+}
+
+function renderDashboardFilters(filters = {}) {
+  const statuses = normalizedFilterEntries(filters.statuses || filters.status);
+  const statusSelect = $(`[data-files-status]`);
+  const currentStatus = statusSelect.value;
+  statusSelect.replaceChildren(new Option("Todos os status", ""));
+  statuses.forEach((entry) => statusSelect.add(new Option(
+    `${entry.label}${entry.count == null ? "" : ` (${formatNumber(entry.count)})`}`,
+    entry.value,
+  )));
+  if ($$("option", statusSelect).some((option) => option.value === currentStatus)) statusSelect.value = currentStatus;
+
+  const typeCounts = new Map(typeEntries(filters.types || filters.type).map((entry) => [entry.value, entry.count]));
+  $$('[data-type-filter]').forEach((control) => {
+    if (!control.dataset.baseLabel) control.dataset.baseLabel = control.textContent;
+    const count = typeCounts.get(control.dataset.typeFilter);
+    control.textContent = `${control.dataset.baseLabel}${count == null ? "" : ` · ${formatNumber(count)}`}`;
+  });
 }
 
 async function health() {
@@ -199,14 +373,16 @@ async function health() {
     element.textContent = `${healthy}/${entries.length} serviços saudáveis`;
     element.classList.toggle("bad", healthy !== entries.length);
     setDomainHealth("gdrive", services["gdrive-source"]?.healthy, "Drive online", "Drive indisponível");
-    setDomainHealth("torrent", services["torrent-engine"]?.healthy, "Motor torrent online", "Motor torrent indisponível");
+    setDomainHealth("filecr", services["torrent-engine"]?.healthy, "FileCR indexado", "Motor torrent indisponível");
+    setDomainHealth("1337x", services["torrent-engine"]?.healthy, "1337x indexado", "Motor torrent indisponível");
     const localHealthy = services.postgres?.healthy && services.redis?.healthy;
     setDomainHealth("local", localHealthy, "Área local pronta", "Área local indisponível");
   } catch {
     element.textContent = "Monitor indisponível";
     element.classList.add("bad");
     setDomainHealth("gdrive", false, "Drive online", "Status indisponível");
-    setDomainHealth("torrent", false, "Motor torrent online", "Status indisponível");
+    setDomainHealth("filecr", false, "FileCR indexado", "Status indisponível");
+    setDomainHealth("1337x", false, "1337x indexado", "Status indisponível");
     setDomainHealth("local", false, "Área local pronta", "Status indisponível");
   }
 }
@@ -216,19 +392,49 @@ async function dashboard() {
     const data = await api("/api/dashboard");
     const totalFiles = Number(data.file_count ?? data.files ?? 0);
     const driveFiles = Number(data.gdrive_file_count ?? data.drive_files ?? data.drive ?? 0);
-    const gdrive = domainSnapshot(data, "gdrive", { files: driveFiles });
-    const local = domainSnapshot(data, "local", { files: data.local_file_count ?? 0 });
-    const torrent = domainSnapshot(data, "torrent", {
+    const legacyTorrent = domainSnapshot(data, "torrent", {
       files: Math.max(0, totalFiles - driveFiles),
       bytes: data.bytes_total,
       titles: data.torrent_count ?? data.titles ?? data.torrents,
     });
-    renderDomain("gdrive", gdrive);
-    renderDomain("local", local);
-    renderDomain("torrent", torrent);
-    setDomainInventoryState("gdrive", gdrive.files, "Inventário remoto pronto para uso", "Drive ainda não catalogado");
-    setDomainInventoryState("local", local.files, "Downloads locais validados", "Nenhum download local concluído");
-    setDomainInventoryState("torrent", torrent.files, "Inventário torrent disponível", "Inventário torrent ainda vazio");
+    const sourceBreakdown = legacyTorrent.sources || data.torrent_sources_by_site || {};
+    const sourceFallback = (source) => {
+      const raw = sourceBreakdown[source] || {};
+      if (typeof raw === "number") return { titles: raw };
+      return {
+        files: raw.files ?? raw.file_count,
+        bytes: raw.bytes ?? raw.bytes_total,
+        titles: raw.titles ?? raw.count ?? raw.torrents,
+        types: raw.types,
+      };
+    };
+    const cards = new Map((Array.isArray(data.source_cards) ? data.source_cards : [])
+      .map((card) => [String(card.source || card.site || "").toLowerCase(), card]));
+    const snapshots = {
+      gdrive: { ...domainSnapshot(data, "gdrive", { files: driveFiles, location: "Google Drive" }), ...cards.get("gdrive") },
+      filecr: { ...sourceFallback("filecr"), ...cards.get("filecr") },
+      "1337x": { ...sourceFallback("1337x"), ...cards.get("1337x") },
+      local: { ...domainSnapshot(data, "local", { files: data.local_file_count ?? 0, location: "Armazenamento local" }), ...cards.get("local") },
+    };
+    Object.entries(snapshots).forEach(([source, snapshot]) => {
+      renderDomain(source, snapshot);
+      if (snapshot.status) {
+        const domainState = $(`[data-domain-state="${source}"]`);
+        const stateClass = statusClass(snapshot.status);
+        domainState.textContent = `${statusLabel(snapshot.status)}${snapshot.location_kind ? ` · ${snapshot.location_kind}` : ""}`;
+        domainState.classList.toggle("ready", stateClass === "ready" || stateClass === "cataloged");
+        domainState.classList.toggle("active", stateClass === "active");
+        domainState.classList.toggle("empty-state", stateClass === "failed" || stateClass === "empty");
+      } else {
+        setDomainInventoryState(
+          source,
+          snapshot.files ?? snapshot.titles,
+          source === "local" ? "Downloads locais validados" : "Inventário disponível",
+          source === "local" ? "Nenhum download local concluído" : "Inventário ainda vazio",
+        );
+      }
+    });
+    renderDashboardFilters(data.filters);
     $("[data-stat='files']").textContent = formatNumber(totalFiles);
     $("[data-stat='bytes']").textContent = optionalBytes(data.bytes_total);
     $("[data-stat='subtitles']").textContent = formatNumber(data.subtitle_count);
@@ -270,13 +476,24 @@ function openFilesDomain(domain) {
   const filters = {
     all: { site: "", presence: "" },
     gdrive: { site: "gdrive", presence: "" },
-    local: { site: "", presence: "local" },
+    local: { site: "local", presence: "local" },
+    filecr: { site: "filecr", presence: "" },
+    "1337x": { site: "1337x", presence: "" },
     torrent: { site: "torrent", presence: "" },
   }[domain] || { site: "", presence: "" };
+  state.selectedSource = domain === "all" ? "" : domain;
+  $$('[data-source-card]').forEach((card) => card.classList.toggle("selected", card.dataset.sourceCard === state.selectedSource));
+  $$('[data-select-source]').forEach((control) => {
+    const selected = control.dataset.selectSource === state.selectedSource;
+    control.setAttribute("aria-pressed", String(selected));
+    if (!control.disabled) control.textContent = selected ? "Selecionado" : "Selecionar";
+  });
   $("[data-files-query]").value = "";
   $("[data-files-site]").value = filters.site;
   $("[data-kind]").value = "";
+  $("[data-files-status]").value = "";
   $("[data-presence]").value = filters.presence;
+  syncTypeControls();
   resetPage("files");
   updateFilesContext();
   setView("files");
@@ -337,60 +554,236 @@ async function catalog() {
   renderPagination("catalog", data, catalog);
 }
 
+function fileIdOf(item) { return item.id ?? item.file_id; }
+
+function transferSiteOf(item) {
+  return [item.site, item.source_site, item.origin_site, item.source]
+    .find((value) => ["gdrive", "filecr", "1337x"].includes(value)) || "";
+}
+
+function fileKey(item) {
+  return [transferSiteOf(item), item.infohash || "", fileIdOf(item), kindOf(item)].join(":");
+}
+
+function hasLocation(item, target) {
+  if (target === "gdrive" && (item.gdrive_present || sourceOf(item) === "gdrive")) return true;
+  if (target === "gdrive" && item.presence_confidence === "possible") return false;
+  if (target === "local" && item.presence === "local") return true;
+  if (item.presence === "both") return true;
+  const values = Array.isArray(item.locations)
+    ? item.locations.map((entry) => typeof entry === "string" ? entry : entry?.kind || entry?.source)
+    : Object.keys(item.locations || {}).filter((key) => item.locations[key]);
+  return values.includes(target) || (target === "gdrive" && values.includes("drive"));
+}
+
+function canTransfer(item, target) {
+  const source = transferSiteOf(item);
+  if (!source || !item.infohash || fileIdOf(item) === undefined || fileIdOf(item) === null) return false;
+  if (target === "gdrive") return source !== "gdrive" && !hasLocation(item, "gdrive");
+  return !hasLocation(item, "local");
+}
+
+function syncTypeControls() {
+  const selected = $("[data-kind]").value;
+  $$('[data-type-filter]').forEach((control) => {
+    const active = control.dataset.typeFilter === selected;
+    control.classList.toggle("active", active);
+    control.setAttribute("aria-pressed", String(active));
+  });
+}
+
+function updateSelectionUI() {
+  const selected = Array.from(state.selectedFiles.values());
+  const localCount = selected.filter((item) => canTransfer(item, "local")).length;
+  const driveCount = selected.filter((item) => canTransfer(item, "gdrive")).length;
+  const bar = $("[data-bulk-bar]");
+  bar.hidden = selected.length === 0;
+  $("[data-selected-count]").textContent = `${formatNumber(selected.length)} arquivo(s) selecionado(s)`;
+  $("[data-bulk-local]").disabled = localCount === 0;
+  $("[data-bulk-local]").textContent = `Manter no Local (${formatNumber(localCount)})`;
+  $("[data-bulk-drive]").disabled = driveCount === 0;
+  $("[data-bulk-drive]").textContent = `Disponibilizar no Drive (${formatNumber(driveCount)})`;
+  $$('[data-file-select]').forEach((control) => {
+    const checked = state.selectedFiles.has(control.dataset.fileSelect);
+    control.checked = checked;
+    control.closest("tr")?.classList.toggle("selected", checked);
+  });
+  const selectable = state.filesItems.filter((item) => canTransfer(item, "local") || canTransfer(item, "gdrive"));
+  const selectedVisible = selectable.filter((item) => state.selectedFiles.has(fileKey(item))).length;
+  const selectVisible = $("[data-select-visible]");
+  selectVisible.disabled = selectable.length === 0;
+  selectVisible.checked = selectable.length > 0 && selectedVisible === selectable.length;
+  selectVisible.indeterminate = selectedVisible > 0 && selectedVisible < selectable.length;
+}
+
+function clearFileSelection() {
+  state.selectedFiles.clear();
+  updateSelectionUI();
+}
+
+function groupValue(item, groupBy) {
+  if (groupBy === "type") return kindOf(item);
+  if (groupBy === "source") return sourceOf(item);
+  if (groupBy === "status") return item.status || "cataloged";
+  if (groupBy === "presence") return item.presence || presenceLabel(item)[0];
+  if (groupBy === "location") return item.location_group || item.location_kind || item.location || locationText(item);
+  return "";
+}
+
+function groupLabel(value, groupBy) {
+  if (groupBy === "type") return kindLabel(value);
+  if (groupBy === "source") return sourceLabel(value);
+  if (groupBy === "status") return statusLabel(value);
+  if (groupBy === "presence") return ({
+    exact: "No Drive", possible: "Possível duplicata", gdrive: "No Drive",
+    not_gdrive: "Fora do Drive", local: "Local", missing: "Somente inventário",
+    both: "Local e Drive",
+  })[value] || value;
+  if (groupBy === "location") return ({
+    torrent: "Somente inventário torrent", local: "Local", gdrive: "Google Drive",
+    both: "Local e Google Drive",
+  })[value] || value;
+  return value || "Sem localização";
+}
+
+function displayGroupLabel(group, groupBy) {
+  const supplied = String(group.label || "").trim();
+  return supplied && supplied.toLowerCase() !== String(group.value).toLowerCase()
+    ? supplied
+    : groupLabel(group.value, groupBy);
+}
+
+function normalizedGroups(groups) {
+  if (Array.isArray(groups)) return groups.map((entry) => ({
+    value: entry.value || entry.key || entry.type || entry.source || entry.status || entry.presence || entry.location,
+    label: entry.label,
+    count: entry.count ?? entry.files ?? entry.total,
+    bytes: entry.bytes ?? entry.size,
+  })).filter((entry) => entry.value);
+  if (groups && typeof groups === "object") return Object.entries(groups).map(([value, entry]) => ({
+    value,
+    label: typeof entry === "object" ? entry.label : null,
+    count: typeof entry === "object" ? entry.count ?? entry.files ?? entry.total : entry,
+    bytes: typeof entry === "object" ? entry.bytes ?? entry.size : null,
+  }));
+  return [];
+}
+
+function renderFileGroups(groups, groupBy) {
+  const target = $("[data-file-groups]");
+  target.replaceChildren();
+  normalizedGroups(groups).forEach((group) => {
+    const displayLabel = displayGroupLabel(group, groupBy);
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "file-group";
+    card.setAttribute("aria-label", `Selecionar itens visíveis do grupo ${displayLabel}`);
+    const label = document.createElement("strong");
+    label.textContent = displayLabel;
+    const count = document.createElement("span");
+    count.textContent = `${formatNumber(group.count)} arquivo(s)${group.bytes == null ? "" : ` · ${bytes(group.bytes)}`}`;
+    const hint = document.createElement("small");
+    hint.textContent = "Selecionar visíveis";
+    card.append(label, count, hint);
+    card.onclick = () => {
+      const matches = state.filesItems.filter((item) => String(groupValue(item, groupBy)).toLowerCase() === String(group.value).toLowerCase());
+      matches.forEach((item) => {
+        if (canTransfer(item, "local") || canTransfer(item, "gdrive")) state.selectedFiles.set(fileKey(item), item);
+      });
+      updateSelectionUI();
+      if (!matches.length) toast("Nenhum item visível pertence a este grupo.");
+    };
+    target.append(card);
+  });
+  target.hidden = target.childElementCount === 0;
+}
+
 async function files() {
   updateFilesContext();
+  syncTypeControls();
+  const selectedSource = $("[data-files-site]").value;
+  const selectedType = $("[data-kind]").value;
   const params = new URLSearchParams({
     q: $("[data-files-query]").value,
-    site: $("[data-files-site]").value,
-    kind: $("[data-kind]").value,
+    source: selectedSource,
+    site: selectedSource === "local" ? "" : selectedSource,
+    type: selectedType,
+    kind: selectedType,
+    status: $("[data-files-status]").value,
     presence: $("[data-presence]").value,
+    group_by: $("[data-group-by]").value,
     page: String(state.pages.files),
     per_page: "100",
   });
+  const requestId = ++state.filesRequest;
   const data = await api(`/api/files?${params}`);
+  if (requestId !== state.filesRequest) return;
+  const items = Array.isArray(data.items) ? data.items : [];
+  state.filesItems = items;
+  state.selectedFiles.clear();
   $("[data-files-total]").textContent = `${formatNumber(data.total)} arquivos`;
+  renderFileGroups(data.groups, data.group_by || $("[data-group-by]").value);
   const body = $("[data-files-body]");
   body.replaceChildren();
-  data.items.forEach((item) => {
+  items.forEach((item) => {
     const row = document.createElement("tr");
+    const selectCell = document.createElement("td");
+    selectCell.className = "select-column";
+    const select = document.createElement("input");
+    select.type = "checkbox";
+    select.dataset.fileSelect = fileKey(item);
+    select.setAttribute("aria-label", `Selecionar ${item.path || item.display_name || "arquivo"}`);
+    select.disabled = !canTransfer(item, "local") && !canTransfer(item, "gdrive");
+    select.onchange = () => {
+      if (select.checked) state.selectedFiles.set(fileKey(item), item);
+      else state.selectedFiles.delete(fileKey(item));
+      updateSelectionUI();
+    };
+    selectCell.append(select);
     const nameCell = document.createElement("td");
     nameCell.className = "file-main";
     const name = document.createElement("strong");
-    name.textContent = item.path?.split(/[\\/]/).at(-1) || item.path;
+    name.textContent = item.path?.split(/[\\/]/).at(-1) || item.display_name || item.path || "Arquivo sem nome";
     const context = document.createElement("small");
-    context.textContent = `${item.title || item.display_name || item.infohash} · ${item.path}`;
+    context.textContent = `${item.title || item.display_name || item.infohash || "Sem título"} · ${item.path || "caminho não informado"}`;
     nameCell.append(name, context);
     const kindCell = document.createElement("td");
     const kind = document.createElement("span");
     kind.className = "kind-badge";
-    kind.textContent = kindLabel(item.file_kind);
+    kind.textContent = kindLabel(kindOf(item));
     kindCell.append(kind);
     const sourceCell = document.createElement("td");
-    sourceCell.textContent = sourceLabel(item.site);
+    const source = document.createElement("span");
+    source.className = `source-badge ${sourceOf(item)}`;
+    source.textContent = sourceLabel(sourceOf(item));
+    sourceCell.append(source);
+    const statusCell = document.createElement("td");
+    const status = document.createElement("span");
+    const rawStatus = item.presence_confidence === "possible" && item.status !== "available"
+      ? "possible"
+      : item.status || (hasLocation(item, "local") || hasLocation(item, "gdrive") ? "available" : "cataloged");
+    status.className = `status-badge ${statusClass(rawStatus)}`;
+    status.textContent = statusLabel(rawStatus);
+    statusCell.append(status);
+    const locationCell = document.createElement("td");
+    locationCell.className = "file-location";
+    locationCell.textContent = locationText(item);
     const sizeCell = document.createElement("td");
     sizeCell.textContent = bytes(item.size);
-    const presenceCell = document.createElement("td");
-    const [presenceClass, presenceText] = presenceLabel(item);
-    const presence = document.createElement("span");
-    presence.className = `presence-badge ${presenceClass}`;
-    presence.textContent = presenceText;
-    presenceCell.append(presence);
     const actionsCell = document.createElement("td");
     const actions = document.createElement("div");
     actions.className = "row-actions";
-    actions.append(button("Abrir", "", () => detail(item.site, item.infohash)));
-    if (item.site === "gdrive") {
-      actions.append(button("Baixar local", "", () => createTransfer(item, "local")));
-    } else {
-      actions.append(button("Baixar local", "", () => createTransfer(item, "local")));
-      if (!item.gdrive_present) actions.append(button("Enviar ao Drive", "", () => createTransfer(item, "gdrive")));
-    }
+    const detailSite = transferSiteOf(item);
+    if (detailSite && item.infohash) actions.append(button("Abrir", "", () => detail(detailSite, item.infohash)));
+    if (canTransfer(item, "local")) actions.append(button("Manter local", "", () => createTransfer(item, "local")));
+    if (canTransfer(item, "gdrive")) actions.append(button("Enviar ao Drive", "", () => createTransfer(item, "gdrive")));
     actionsCell.append(actions);
-    row.append(nameCell, kindCell, sourceCell, sizeCell, presenceCell, actionsCell);
+    row.append(selectCell, nameCell, kindCell, sourceCell, statusCell, locationCell, sizeCell, actionsCell);
     body.append(row);
   });
-  $("[data-files-empty]").hidden = data.items.length !== 0;
-  $(".table-shell").hidden = data.items.length === 0;
+  $("[data-files-empty]").hidden = items.length !== 0;
+  $(".table-shell").hidden = items.length === 0;
+  updateSelectionUI();
   renderPagination("files", data, files);
 }
 
@@ -481,42 +874,93 @@ async function detail(site, infohash) {
 }
 
 async function createTransfer(item, target) {
-  const size = Number(item.size || 0);
-  const isLarge = size >= LARGE_TRANSFER_BYTES;
-  const fileId = item.id ?? item.file_id;
-  if (fileId === undefined || fileId === null || fileId === "") {
-    throw new Error("O arquivo selecionado não possui um identificador válido.");
+  return createTransfers([item], target);
+}
+
+function transferGroups(items, target) {
+  const grouped = new Map();
+  items.filter((item) => canTransfer(item, target)).forEach((item) => {
+    const site = transferSiteOf(item);
+    const kind = kindOf(item);
+    const key = `${site}:${item.infohash}:${kind}`;
+    if (!grouped.has(key)) grouped.set(key, { site, infohash: item.infohash, kind, items: [] });
+    grouped.get(key).items.push(item);
+  });
+  const chunks = [];
+  grouped.forEach((group) => {
+    for (let index = 0; index < group.items.length; index += 200) {
+      chunks.push({ ...group, items: group.items.slice(index, index + 200) });
+    }
+  });
+  return chunks;
+}
+
+async function createTransfers(items, target) {
+  const groups = transferGroups(items, target);
+  if (!groups.length) {
+    toast(target === "gdrive" ? "Os itens selecionados já estão no Drive ou não podem ser enviados." : "Os itens selecionados já estão disponíveis localmente.");
+    return [];
   }
-  const transferKey = `${item.site}:${item.infohash}:${fileId}:${target}`;
-  if (state.pendingTransfers.has(transferKey)) {
-    toast("Esta transferência já está sendo enviada.");
-    return;
+  const selectedItems = groups.flatMap((group) => group.items);
+  const totalSize = selectedItems.reduce((total, item) => total + Number(item.size || 0), 0);
+  const warnings = [
+    `${formatNumber(selectedItems.length)} arquivo(s) serão divididos em ${formatNumber(groups.length)} transferência(s) por origem, torrent e tipo.`,
+    "A raiz classificada e todos os caminhos relativos serão mantidos.",
+  ];
+  const ignoredCount = items.length - selectedItems.length;
+  if (ignoredCount > 0) {
+    warnings.push(`${formatNumber(ignoredCount)} item(ns) não são elegíveis para este destino e permanecerão selecionados.`);
   }
-  const warnings = [];
-  if (item.file_kind === "software") warnings.push("Este arquivo é software. A plataforma apenas o armazena e nunca o executa.");
-  if (isLarge) warnings.push(`A transferência tem ${bytes(size)} e pode consumir bastante disco, rede e tempo.`);
-  if (target === "gdrive") warnings.push("O conteúdo será baixado para a área local e publicado na pasta classificada do Google Drive.");
-  if (warnings.length && !window.confirm(`${warnings.join("\n\n")}\n\nContinuar?`)) return;
-  const payload = {
-    site: item.site,
-    infohash: item.infohash,
-    file_ids: [fileId],
-    target,
-  };
-  if (isLarge) payload.confirm_large = true;
-  state.pendingTransfers.add(transferKey);
-  try {
-    const result = await api("/api/transfers", {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-    toast(target === "gdrive" ? "Transferência para o Drive enfileirada." : "Download local enfileirado.");
+  if (selectedItems.some((item) => kindOf(item) === "software")) {
+    warnings.push("A seleção contém software. A plataforma apenas armazena esses arquivos e nunca os executa.");
+  }
+  if (target === "gdrive" && selectedItems.some((item) => item.presence_confidence === "possible")) {
+    warnings.push("Há possíveis duplicatas no Drive por nome e tamanho. A correspondência não foi confirmada por hash; revise antes de continuar.");
+  }
+  if (totalSize >= LARGE_TRANSFER_BYTES) warnings.push(`O volume selecionado é ${bytes(totalSize)} e pode consumir bastante disco, rede e tempo.`);
+  if (target === "gdrive") warnings.push("O conteúdo será baixado para a área local antes da publicação na pasta classificada do Google Drive.");
+  else warnings.push("O conteúdo será mantido na área local dentro da pasta classificada correspondente.");
+  if (!window.confirm(`${warnings.join("\n\n")}\n\nContinuar?`)) return [];
+
+  const results = [];
+  const failures = [];
+  const completedItems = [];
+  for (const group of groups) {
+    const fileIds = group.items.map(fileIdOf);
+    const transferKey = `${group.site}:${group.infohash}:${group.kind}:${target}:${fileIds.join(",")}`;
+    if (state.pendingTransfers.has(transferKey)) continue;
+    state.pendingTransfers.add(transferKey);
+    try {
+      const payload = {
+        site: group.site,
+        infohash: group.infohash,
+        file_ids: fileIds,
+        target,
+      };
+      if (totalSize >= LARGE_TRANSFER_BYTES) payload.confirm_large = true;
+      const result = await api("/api/transfers", { method: "POST", body: JSON.stringify(payload) });
+      results.push(result);
+      completedItems.push(...group.items);
+    } catch (error) {
+      failures.push(error);
+    } finally {
+      state.pendingTransfers.delete(transferKey);
+    }
+  }
+  if (results.length) {
+    toast(`${formatNumber(results.length)} transferência(s) enfileirada(s) para ${target === "gdrive" ? "o Drive" : "a área local"}.`);
+    completedItems.forEach((item) => state.selectedFiles.delete(fileKey(item)));
+    updateSelectionUI();
     await dashboard();
     resetPage("transfers");
-    setView("transfers");
-    return result;
-  } catch (error) { showError(error); }
-  finally { state.pendingTransfers.delete(transferKey); }
+    if (state.selectedFiles.size === 0) {
+      setView("transfers");
+      $("#tab-transfers")?.focus();
+    }
+    else toast(`${formatNumber(state.selectedFiles.size)} item(ns) permaneceram selecionados para outra ação ou nova tentativa.`);
+  }
+  if (failures.length) toast(`${formatNumber(failures.length)} grupo(s) não puderam ser enfileirados: ${failures[0].message}`, true);
+  return results;
 }
 
 function transferProgress(item) {
@@ -860,6 +1304,7 @@ $("[data-health]").onclick = () => health();
 $("[data-sync-drive]").onclick = syncDrive;
 $("[data-open-all]").onclick = () => openFilesDomain("all");
 $("[data-open-transfers]").onclick = () => setView("transfers");
+$$('[data-select-source]').forEach((item) => { item.onclick = () => selectSource(item.dataset.selectSource, true); });
 $$('[data-open-domain]').forEach((item) => { item.onclick = () => openFilesDomain(item.dataset.openDomain); });
 $("[data-catalog-search]").onclick = () => { resetPage("catalog"); catalog().catch(showError); };
 $("[data-catalog-query]").onkeydown = (event) => {
@@ -875,9 +1320,40 @@ $("[data-files-search]").onclick = () => { resetPage("files"); files().catch(sho
 $("[data-files-query]").onkeydown = (event) => {
   if (event.key === "Enter") { resetPage("files"); files().catch(showError); }
 };
-$("[data-files-site]").onchange = () => { resetPage("files"); files().catch(showError); };
-$("[data-kind]").onchange = () => { resetPage("files"); files().catch(showError); };
+$("[data-files-site]").onchange = () => {
+  state.selectedSource = $("[data-files-site]").value;
+  $$('[data-source-card]').forEach((card) => card.classList.toggle("selected", card.dataset.sourceCard === state.selectedSource));
+  $$('[data-select-source]').forEach((control) => {
+    const selected = control.dataset.selectSource === state.selectedSource;
+    control.setAttribute("aria-pressed", String(selected));
+    if (!control.disabled) control.textContent = selected ? "Selecionado" : "Selecionar";
+  });
+  resetPage("files");
+  files().catch(showError);
+};
+$("[data-kind]").onchange = () => { syncTypeControls(); resetPage("files"); files().catch(showError); };
+$("[data-files-status]").onchange = () => { resetPage("files"); files().catch(showError); };
 $("[data-presence]").onchange = () => { resetPage("files"); files().catch(showError); };
+$("[data-group-by]").onchange = () => { resetPage("files"); files().catch(showError); };
+$$('[data-type-filter]').forEach((control) => {
+  control.onclick = () => {
+    $("[data-kind]").value = control.dataset.typeFilter;
+    syncTypeControls();
+    resetPage("files");
+    files().catch(showError);
+  };
+});
+$("[data-select-visible]").onchange = (event) => {
+  state.filesItems.forEach((item) => {
+    const key = fileKey(item);
+    if (event.currentTarget.checked && (canTransfer(item, "local") || canTransfer(item, "gdrive"))) state.selectedFiles.set(key, item);
+    else state.selectedFiles.delete(key);
+  });
+  updateSelectionUI();
+};
+$("[data-clear-selection]").onclick = clearFileSelection;
+$("[data-bulk-local]").onclick = () => createTransfers(Array.from(state.selectedFiles.values()), "local").catch(showError);
+$("[data-bulk-drive]").onclick = () => createTransfers(Array.from(state.selectedFiles.values()), "gdrive").catch(showError);
 $("[data-refresh-transfers]").onclick = () => transfers().catch(showError);
 startButton.onclick = () => startPlayback(true);
 $("[data-close]").onclick = async () => { await destroySession(); $("[data-player]").hidden = true; };

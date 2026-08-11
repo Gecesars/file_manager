@@ -13,7 +13,10 @@ fluxo persistente **torrent → pasta local → classificação → Google Drive
 
 - ingestão consistente dos SQLite vivos do FileCR, 1337x, OMDb e SubtitleVault;
 - PostgreSQL como catálogo canônico e Redis apenas para sinais transitórios;
-- explorador por texto, fonte, tipo e presença local/Drive;
+- dashboard com cards separados e selecionáveis para Drive, FileCR, 1337x e
+  Local, com status, localização, tipos e volume por fonte;
+- explorador por texto, fonte, tipo, status e presença local/Drive, com
+  agrupamento e ações em lote por tipo;
 - classificação em vídeo, áudio, legenda, imagem, documento, compactado,
   software, dataset e outros;
 - deduplicação exata por SHA-256 + tamanho e indicação conservadora de possível
@@ -166,13 +169,21 @@ colocar essa capability na linha de comando ou nos logs.
 
 Mostra todos os itens descritos pelos inventários, inclusive documentos,
 arquivos compactados e software. Software pode ser armazenado, mas nunca é
-executado. As ações disponíveis são:
+executado. A seleção em lote é separada por origem, torrent e tipo, com no
+máximo 200 arquivos em cada job. As ações disponíveis são:
 
-- **Baixar local**: materializa somente os arquivos selecionados em
-  `storage/media`;
+- **Manter no Local**: materializa somente os arquivos selecionados e os publica
+  em `storage/media/tipo/categoria/título/caminho-relativo-original`;
 - **Disponibilizar no Drive**: materializa, verifica, classifica, cria as pastas
-  necessárias e envia por upload resumível;
+  necessárias e envia por upload resumível, preservando a mesma subárvore;
 - **Abrir**: mostra todos os arquivos do título e as legendas relacionadas.
+
+A publicação local tenta primeiro um hardlink verificado para não duplicar os
+bytes usados pelo seeding; quando o filesystem não permite, usa cópia temporária
+atômica e valida SHA-256. O arquivo de seed nunca é movido nem removido. Um
+download feito apenas como etapa de um envio ao Drive não entra no card Local:
+para manter a cópia classificada nos dois destinos, execute também **Manter no
+Local**.
 
 ### Transferências
 

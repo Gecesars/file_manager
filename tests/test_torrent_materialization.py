@@ -13,6 +13,7 @@ from ofc_media import torrent_service
 from ofc_media.safety import UnsafeMediaError, encode_bencode
 from ofc_media.torrent_service import (
     Materialization,
+    MaterializedFile,
     StreamSession,
     TorrentCapacityError,
     TorrentEngine,
@@ -157,6 +158,7 @@ def install_job(
     updates: list[dict[str, object]],
     target: str = "gdrive",
     state: str = "queued",
+    destination_path: str = "video/Filmes/Teste",
 ) -> None:
     job = {
         "id": job_id,
@@ -164,6 +166,7 @@ def install_job(
         "infohash": infohash,
         "target": target,
         "state": state,
+        "destination_path": destination_path,
         "selected_file_ids": [row["id"] for row in rows],
         "metainfo_relpath": "bundle.torrent",
     }
@@ -311,12 +314,196 @@ def test_completed_local_materialization_reaches_terminal_state(tmp_path: Path):
     status = engine._refresh_materialization(job_id)
 
     assert status["state"] == "completed"
-    assert [entry["state"] for entry in updates[-4:]] == [
+    states = [entry["state"] for entry in updates]
+    transitions = [
+        value
+        for index, value in enumerate(states)
+        if index == 0 or value != states[index - 1]
+    ]
+    assert transitions[-4:] == [
         "downloaded",
         "classifying",
         "verifying",
         "completed",
     ]
+    manifest = updates[-1]["local_files"][0]
+    classified = (
+        engine.settings.media_root
+        / "video"
+        / "Filmes"
+        / "Teste"
+        / "payload.bin"
+    )
+    assert Path(manifest["local_path"]) == classified
+    assert manifest["relative_path"] == "payload.bin"
+    assert classified.read_bytes() == b"abc"
+    assert materialized.read_bytes() == b"abc"
+
+
+def test_local_publication_preserves_nested_tree_and_avoids_name_collision(
+    tmp_path: Path,
+):
+    torrent_root = tmp_path / "torrents"
+    _path, infohash, torrent_info = make_metainfo(
+        torrent_root, [("Season 01/Episode.mkv", 3)]
+    )
+    engine = make_engine(tmp_path, torrent_info)
+    job_id = str(uuid.uuid4())
+    updates: list[dict[str, object]] = []
+    install_job(
+        engine,
+        job_id=job_id,
+        infohash=infohash,
+        rows=[{"id": 77, "path": "Season 01/Episode.mkv", "size": 3}],
+        updates=updates,
+        target="local",
+        destination_path="video/Series/Minha Serie",
+    )
+    collision = (
+        engine.settings.media_root
+        / "video"
+        / "Series"
+        / "Minha Serie"
+        / "Season 01"
+        / "Episode.mkv"
+    )
+    collision.parent.mkdir(parents=True)
+    collision.write_bytes(b"old")
+    item = engine.materialize(job_id)
+    assert item is not None
+    item.files[0].file_path.parent.mkdir(parents=True, exist_ok=True)
+    item.files[0].file_path.write_bytes(b"new")
+    engine.handle.progress[0] = 3
+
+    status = engine._refresh_materialization(job_id)
+
+    published = (
+        collision.parent / "Episode~77.mkv"
+    )
+    assert status["state"] == "completed"
+    assert collision.read_bytes() == b"old"
+    assert published.read_bytes() == b"new"
+    assert updates[-1]["local_files"][0]["relative_path"] == (
+        "Season 01/Episode~77.mkv"
+    )
+
+
+def test_local_publication_strips_only_classified_root_overlap(tmp_path: Path):
+    torrent_root = tmp_path / "torrents"
+    relative = "video/Series/Dexter/Season 01/Episode.mkv"
+    _path, infohash, torrent_info = make_metainfo(
+        torrent_root, [(relative, 3)]
+    )
+    engine = make_engine(tmp_path, torrent_info)
+    job_id = str(uuid.uuid4())
+    updates: list[dict[str, object]] = []
+    install_job(
+        engine,
+        job_id=job_id,
+        infohash=infohash,
+        rows=[{"id": 81, "path": relative, "size": 3}],
+        updates=updates,
+        target="local",
+        destination_path="video/Series/Dexter",
+    )
+    item = engine.materialize(job_id)
+    assert item is not None
+    item.files[0].file_path.parent.mkdir(parents=True, exist_ok=True)
+    item.files[0].file_path.write_bytes(b"new")
+    engine.handle.progress[0] = 3
+
+    assert engine._refresh_materialization(job_id)["state"] == "completed"
+    published = (
+        engine.settings.media_root
+        / "video"
+        / "Series"
+        / "Dexter"
+        / "Season 01"
+        / "Episode.mkv"
+    )
+    assert published.read_bytes() == b"new"
+    assert not (
+        published.parent.parent / "video" / "Series" / "Dexter"
+    ).exists()
+
+
+def test_local_publication_rejects_symlinked_torrent_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    torrent_root = tmp_path / "torrents"
+    _path, infohash, torrent_info = make_metainfo(
+        torrent_root, [("payload.bin", 3)]
+    )
+    engine = make_engine(tmp_path, torrent_info)
+    job_id = str(uuid.uuid4())
+    updates: list[dict[str, object]] = []
+    install_job(
+        engine,
+        job_id=job_id,
+        infohash=infohash,
+        rows=[{"id": 82, "path": "payload.bin", "size": 3}],
+        updates=updates,
+        target="local",
+    )
+    item = engine.materialize(job_id)
+    assert item is not None
+    source = item.files[0].file_path
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_bytes(b"bad")
+    original_check = engine._is_link_or_junction
+    monkeypatch.setattr(
+        engine,
+        "_is_link_or_junction",
+        lambda path: path.absolute() == source.absolute() or original_check(path),
+    )
+    engine.handle.progress[0] = 3
+
+    with pytest.raises(torrent_service.UnsafeMediaError):
+        engine._refresh_materialization(job_id)
+    assert not (
+        engine.settings.media_root / "video" / "Filmes" / "Teste" / "payload.bin"
+    ).exists()
+
+
+def test_cancel_winning_classification_claim_does_not_publish(tmp_path: Path):
+    engine = make_engine(tmp_path, FakeTorrentInfo([("payload.bin", 3)]))
+    infohash = "b" * 40
+    source = engine.settings.media_root / f"filecr-{infohash}" / "payload.bin"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"abc")
+    item = Materialization(
+        id=str(uuid.uuid4()),
+        download_key=f"filecr-{infohash}",
+        target="local",
+        files=(MaterializedFile(83, 0, "payload.bin", 3, source),),
+        bytes_total=3,
+        destination_path="video/Filmes/Cancelado",
+    )
+    writes = 0
+
+    def conditional_write(_job_id: str, **_values: object) -> bool:
+        nonlocal writes
+        writes += 1
+        return writes == 1
+
+    engine._write_transfer_progress = conditional_write
+    engine._read_transfer_status = lambda _job_id: {"state": "cancelled"}
+
+    state = engine._persist_materialization_snapshot(
+        item,
+        state="downloaded",
+        bytes_done=3,
+        local_files=[{**item.files[0].as_dict(), "complete": True}],
+    )
+
+    assert state == "cancelled"
+    assert not (
+        engine.settings.media_root
+        / "video"
+        / "Filmes"
+        / "Cancelado"
+        / "payload.bin"
+    ).exists()
 
 
 @pytest.mark.parametrize("interrupted_state", ["queued", "validating", "downloading"])
@@ -605,9 +792,9 @@ def test_recovery_stops_at_capacity_and_keeps_remaining_jobs_queued(tmp_path: Pa
 @pytest.mark.parametrize(
     ("persisted_state", "expected_transitions"),
     [
-        ("downloaded", ["classifying", "verifying", "completed"]),
-        ("classifying", ["verifying", "completed"]),
-        ("verifying", ["completed"]),
+        ("downloaded", ["classifying", "classifying", "verifying", "completed"]),
+        ("classifying", ["classifying", "verifying", "completed"]),
+        ("verifying", ["verifying", "completed"]),
     ],
 )
 def test_recovery_finishes_validated_local_manifest_from_each_intermediate_state(
@@ -617,7 +804,13 @@ def test_recovery_finishes_validated_local_manifest_from_each_intermediate_state
 ):
     engine = make_engine(tmp_path, FakeTorrentInfo([("bundle/payload.bin", 3)]))
     job_id = str(uuid.uuid4())
-    local_path = engine.settings.media_root / "filecr-job" / "bundle" / "payload.bin"
+    infohash = "a" * 40
+    local_path = (
+        engine.settings.media_root
+        / f"filecr-{infohash}"
+        / "bundle"
+        / "payload.bin"
+    )
     local_path.parent.mkdir(parents=True)
     local_path.write_bytes(b"abc")
     manifest = [
@@ -634,8 +827,10 @@ def test_recovery_finishes_validated_local_manifest_from_each_intermediate_state
     status = {
         "id": job_id,
         "source_site": "filecr",
+        "infohash": infohash,
         "target": "local",
         "state": persisted_state,
+        "destination_path": "video/Series/Teste",
         "selected_file_ids": [7],
         "bytes_total": 3,
         "bytes_done": 3,
@@ -656,9 +851,60 @@ def test_recovery_finishes_validated_local_manifest_from_each_intermediate_state
     assert engine._recover_materializations_once() == 1
 
     assert [entry["state"] for entry in updates] == expected_transitions
-    assert all(entry["local_files"] == manifest for entry in updates)
+    assert all(entry["local_files"] for entry in updates)
     assert all(entry["bytes_done"] == entry["bytes_total"] == 3 for entry in updates)
     assert errors == []
+    assert (
+        engine.settings.media_root / "video" / "Series" / "Teste" / "payload.bin"
+    ).read_bytes() == b"abc"
+
+
+def test_recovery_reuses_published_collision_when_staging_is_gone(tmp_path: Path):
+    engine = make_engine(tmp_path, FakeTorrentInfo([("Episode.mkv", 3)]))
+    job_id = str(uuid.uuid4())
+    infohash = "c" * 40
+    destination = engine.settings.media_root / "video" / "Series" / "Dexter"
+    published = destination / "Season 01" / "Episode~77.mkv"
+    published.parent.mkdir(parents=True)
+    published.write_bytes(b"abc")
+    missing_staging = (
+        engine.settings.media_root / f"filecr-{infohash}" / "Episode.mkv"
+    )
+    manifest = [
+        {
+            "file_id": 77,
+            "file_index": 0,
+            "path": "Season 01/Episode.mkv",
+            "relative_path": "Season 01/Episode~77.mkv",
+            "source_path": str(missing_staging),
+            "local_path": str(published),
+            "size": 3,
+            "bytes_done": 3,
+            "complete": True,
+        }
+    ]
+    status = {
+        "id": job_id,
+        "source_site": "filecr",
+        "infohash": infohash,
+        "target": "local",
+        "state": "verifying",
+        "destination_path": "video/Series/Dexter",
+        "selected_file_ids": [77],
+        "bytes_total": 3,
+        "bytes_done": 3,
+        "local_files": manifest,
+    }
+    updates: list[dict[str, object]] = []
+    engine._read_transfer_status = lambda _job_id: status
+    engine._write_transfer_progress = (
+        lambda _job_id, **values: updates.append(dict(values)) or True
+    )
+
+    assert engine._recover_local_completion(job_id) is True
+    assert [entry["state"] for entry in updates] == ["verifying", "completed"]
+    assert Path(updates[-1]["local_files"][0]["local_path"]) == published
+    assert published.read_bytes() == b"abc"
 
 
 def test_recovery_marks_local_job_failed_when_manifest_escapes_media_root(

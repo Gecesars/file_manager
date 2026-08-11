@@ -327,7 +327,7 @@ def test_transfer_idempotency_returns_existing_job_under_advisory_lock(
 def test_large_transfer_requires_explicit_confirmation(
     monkeypatch: pytest.MonkeyPatch,
 ):
-    large_size = LARGE_TRANSFER_BYTES + 1
+    large_size = LARGE_TRANSFER_BYTES
     file_row = {
         "id": 4,
         "path": "release/grande.mkv",
@@ -506,6 +506,42 @@ def test_transfer_selection_rejects_unsafe_or_unowned_files(
     assert not any("INSERT INTO runtime.transfer_jobs" in sql for sql, _ in database.calls)
 
 
+def test_transfer_selection_must_be_grouped_by_file_kind(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = TransferDatabase(
+        [
+            {
+                "id": 4,
+                "path": "release/filme.mkv",
+                "file_kind": "video",
+                "mime_type": "video/x-matroska",
+                "size": 123,
+            },
+            {
+                "id": 5,
+                "path": "release/filme.srt",
+                "file_kind": "subtitle",
+                "mime_type": "application/x-subrip",
+                "size": 12,
+            },
+        ]
+    )
+    install_connection(monkeypatch, database)
+
+    with pytest.raises(ValueError, match="agrupe a transferencia por tipo"):
+        bare_plane(torrent_engine_url="http://torrent").create_transfer(
+            site="filecr",
+            infohash=INFOHASH,
+            target="local",
+            file_ids=[4, 5],
+        )
+
+    assert not any(
+        "INSERT INTO runtime.transfer_jobs" in sql for sql, _ in database.calls
+    )
+
+
 def test_drive_sync_is_internal_and_audited(monkeypatch: pytest.MonkeyPatch):
     database = QueueDatabase()
     install_connection(monkeypatch, database)
@@ -577,12 +613,14 @@ def test_http_routes_keep_security_headers_and_translate_errors(
     monkeypatch: pytest.MonkeyPatch,
 ):
     transfer_confirmations: list[bool] = []
+    file_queries: list[dict[str, Any]] = []
 
     class FakePlane:
         def dashboard(self) -> dict[str, int]:
             return {"titles": 1}
 
-        def files(self, **_kwargs: Any) -> dict[str, Any]:
+        def files(self, **kwargs: Any) -> dict[str, Any]:
+            file_queries.append(kwargs)
             return {"items": [], "total": 0}
 
         def transfers(self, **_kwargs: Any) -> dict[str, Any]:
@@ -622,6 +660,15 @@ def test_http_routes_keep_security_headers_and_translate_errors(
 
     assert client.get("/api/dashboard").get_json() == {"titles": 1}
     assert client.get("/api/files").status_code == 200
+    grouped_files = client.get(
+        "/api/files?source=local&kind=video&status=available&group_by=type"
+    )
+    assert grouped_files.status_code == 200
+    assert file_queries[-1]["source"] == "local"
+    assert file_queries[-1]["site"] is None
+    assert file_queries[-1]["kind"] == "video"
+    assert file_queries[-1]["status"] == "available"
+    assert file_queries[-1]["group_by"] == "type"
     assert client.get("/api/transfers").status_code == 200
     assert (
         client.post(

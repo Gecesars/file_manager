@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from .file_kinds import FILE_KINDS
 
 
 SITES = frozenset({"filecr", "1337x", "gdrive"})
-EXPLORER_SITES = SITES | {"torrent"}
+SOURCE_CARDS = ("gdrive", "filecr", "1337x", "local")
+EXPLORER_SITES = SITES | {"torrent", "local"}
+EXPLORER_STATUSES = frozenset({"available", "cataloged"})
+EXPLORER_GROUPS = frozenset({"type", "status", "source", "presence", "location"})
+SOURCE_METADATA: dict[str, tuple[str, str, str]] = {
+    "gdrive": ("Google Drive", "Google Drive", "gdrive"),
+    "filecr": ("FileCR", "Catalogo FileCR", "torrent"),
+    "1337x": ("1337x", "Catalogo 1337x", "torrent"),
+    "local": ("Local", "Armazenamento local", "local"),
+}
 TRANSFER_STATES = frozenset(
     {
         "queued",
@@ -61,10 +70,29 @@ WITH torrent_source_sites(site) AS (
 ), local_presence AS (
     SELECT DISTINCT f.id AS file_id,f.torrent_id,f.file_kind,f.size
     FROM runtime.transfer_jobs job
-    CROSS JOIN LATERAL unnest(job.selected_file_ids) selected(file_id)
+    CROSS JOIN LATERAL unnest(job.selected_file_ids)
+         WITH ORDINALITY AS selected(file_id, ordinal)
+    JOIN LATERAL jsonb_array_elements(job.local_files)
+         WITH ORDINALITY AS local_manifest(value, ordinal)
+      ON local_manifest.value->>'file_id'=selected.file_id::text
+      OR (
+          local_manifest.value->>'file_id' IS NULL
+          AND local_manifest.ordinal=selected.ordinal
+      )
     JOIN catalog.torrent_files f ON f.id=selected.file_id
-    WHERE job.state='completed'
+    WHERE job.state='completed' AND job.target='local'
       AND jsonb_array_length(job.local_files) > 0
+      AND NULLIF(local_manifest.value->>'local_path','') IS NOT NULL
+      AND right(
+          replace(local_manifest.value->>'local_path', E'\\', '/'),
+          length('/' || job.destination_path || '/' || COALESCE(
+              local_manifest.value->>'relative_path',
+              local_manifest.value->>'path'
+          ))
+      ) = '/' || job.destination_path || '/' || COALESCE(
+          local_manifest.value->>'relative_path',
+          local_manifest.value->>'path'
+      )
 ), torrent_source_stats AS (
     SELECT
         sites.site,
@@ -79,10 +107,50 @@ WITH torrent_source_sites(site) AS (
     SELECT file_kind, count(*) AS file_count, COALESCE(sum(size), 0) AS bytes_total
     FROM visible_files
     GROUP BY file_kind
+), source_kind_counts AS (
+    SELECT site AS source,file_kind,count(*) AS file_count,
+           COALESCE(sum(size), 0) AS bytes_total
+    FROM source_files
+    GROUP BY site,file_kind
+
+    UNION ALL
+
+    SELECT 'gdrive'::text AS source,file_kind,count(*) AS file_count,
+           COALESCE(sum(size), 0) AS bytes_total
+    FROM drive_presence
+    GROUP BY file_kind
+
+    UNION ALL
+
+    SELECT 'local'::text AS source,file_kind,count(*) AS file_count,
+           COALESCE(sum(size), 0) AS bytes_total
+    FROM local_presence
+    GROUP BY file_kind
+), source_type_objects AS (
+    SELECT source,jsonb_object_agg(
+        file_kind,
+        jsonb_build_object('count', file_count, 'bytes', bytes_total)
+        ORDER BY file_kind
+    ) AS types
+    FROM source_kind_counts
+    GROUP BY source
 ), transfer_counts AS (
     SELECT state, count(*) AS job_count
     FROM runtime.transfer_jobs
     GROUP BY state
+), source_transfer_counts AS (
+    SELECT source,state,count(*) AS job_count
+    FROM (
+        SELECT source_site AS source,state FROM runtime.transfer_jobs
+        UNION ALL
+        SELECT target AS source,state FROM runtime.transfer_jobs
+        WHERE target IN ('local','gdrive')
+    ) transfers
+    GROUP BY source,state
+), source_transfer_objects AS (
+    SELECT source,jsonb_object_agg(state, job_count ORDER BY state) AS states
+    FROM source_transfer_counts
+    GROUP BY source
 )
 SELECT
     (SELECT count(*) FROM catalog.torrents WHERE active) AS torrent_count,
@@ -117,12 +185,48 @@ SELECT
                     'bytes', bytes_total
                 ) ORDER BY site) FROM torrent_source_stats),
         '{}'::jsonb
-    ) AS torrent_sources_by_site
+    ) AS torrent_sources_by_site,
+    COALESCE(
+        (SELECT jsonb_object_agg(source, types ORDER BY source)
+         FROM source_type_objects),
+        '{}'::jsonb
+    ) AS source_types_by_source,
+    COALESCE(
+        (SELECT jsonb_object_agg(source, states ORDER BY source)
+         FROM source_transfer_objects),
+        '{}'::jsonb
+    ) AS source_transfers_by_source
 """
 
 
 EXPLORER_SQL = r"""
-WITH candidate_files AS NOT MATERIALIZED (
+WITH completed_local_files AS MATERIALIZED (
+    SELECT DISTINCT selected.file_id
+    FROM runtime.transfer_jobs local_job
+    CROSS JOIN LATERAL unnest(local_job.selected_file_ids)
+         WITH ORDINALITY AS selected(file_id, ordinal)
+    JOIN LATERAL jsonb_array_elements(local_job.local_files)
+         WITH ORDINALITY AS local_manifest(value, ordinal)
+      ON local_manifest.value->>'file_id'=selected.file_id::text
+      OR (
+          local_manifest.value->>'file_id' IS NULL
+          AND local_manifest.ordinal=selected.ordinal
+      )
+    WHERE CAST(%(site)s AS text)='local'
+      AND local_job.state='completed' AND local_job.target='local'
+      AND jsonb_array_length(local_job.local_files) > 0
+      AND NULLIF(local_manifest.value->>'local_path','') IS NOT NULL
+      AND right(
+          replace(local_manifest.value->>'local_path', E'\\', '/'),
+          length('/' || local_job.destination_path || '/' || COALESCE(
+              local_manifest.value->>'relative_path',
+              local_manifest.value->>'path'
+          ))
+      ) = '/' || local_job.destination_path || '/' || COALESCE(
+          local_manifest.value->>'relative_path',
+          local_manifest.value->>'path'
+      )
+), candidate_files AS NOT MATERIALIZED (
     SELECT
         f.id AS file_id,
         f.torrent_id,
@@ -145,7 +249,13 @@ WITH candidate_files AS NOT MATERIALIZED (
         trim(f.sha256) AS sha256
     FROM catalog.torrent_files f
     JOIN catalog.torrents t ON t.id=f.torrent_id
-    WHERE t.active
+    LEFT JOIN completed_local_files persistent_local
+      ON persistent_local.file_id=f.id
+    WHERE (
+          t.active
+          OR (CAST(%(site)s AS text)='local'
+              AND persistent_local.file_id IS NOT NULL)
+      )
       AND (
           t.site <> 'gdrive'
           OR EXISTS (
@@ -153,12 +263,15 @@ WITH candidate_files AS NOT MATERIALIZED (
               WHERE own_drive.torrent_file_id=f.id
                 AND own_drive.active AND own_drive.can_download
           )
+          OR (CAST(%(site)s AS text)='local'
+              AND persistent_local.file_id IS NOT NULL)
       )
       AND (
           CAST(%(site)s AS text) IS NULL
           OR t.site=CAST(%(site)s AS text)
           OR (CAST(%(site)s AS text)='torrent'
               AND t.site IN ('filecr','1337x'))
+          OR CAST(%(site)s AS text)='local'
       )
       AND (CAST(%(kind)s AS text) IS NULL OR f.file_kind=CAST(%(kind)s AS text))
       AND (
@@ -235,15 +348,43 @@ WITH candidate_files AS NOT MATERIALIZED (
     FROM drive_matches
     ORDER BY source_file_id, match_priority, updated_at DESC, drive_file_id
 ), local_presence AS MATERIALIZED (
-    SELECT DISTINCT selected.file_id
+    SELECT DISTINCT ON (selected.file_id)
+        selected.file_id,
+        COALESCE(local_manifest.value->>'relative_path',
+                 local_manifest.value->>'path') AS relative_path,
+        local_job.destination_path,
+        local_job.updated_at
     FROM runtime.transfer_jobs local_job
-    CROSS JOIN LATERAL unnest(local_job.selected_file_ids) selected(file_id)
-    WHERE local_job.state='completed'
+    CROSS JOIN LATERAL unnest(local_job.selected_file_ids)
+         WITH ORDINALITY AS selected(file_id, ordinal)
+    JOIN candidate_files local_candidate ON local_candidate.file_id=selected.file_id
+    JOIN LATERAL jsonb_array_elements(local_job.local_files)
+         WITH ORDINALITY AS local_manifest(value, ordinal)
+      ON local_manifest.value->>'file_id'=selected.file_id::text
+      OR (
+          local_manifest.value->>'file_id' IS NULL
+          AND local_manifest.ordinal=selected.ordinal
+      )
+    WHERE local_job.state='completed' AND local_job.target='local'
       AND jsonb_array_length(local_job.local_files) > 0
+      AND NULLIF(local_manifest.value->>'local_path','') IS NOT NULL
+      AND right(
+          replace(local_manifest.value->>'local_path', E'\\', '/'),
+          length('/' || local_job.destination_path || '/' || COALESCE(
+              local_manifest.value->>'relative_path',
+              local_manifest.value->>'path'
+          ))
+      ) = '/' || local_job.destination_path || '/' || COALESCE(
+          local_manifest.value->>'relative_path',
+          local_manifest.value->>'path'
+      )
+    ORDER BY selected.file_id,local_job.updated_at DESC,local_job.id DESC
 ), matched AS (
     SELECT
         source_file.*,
         (local_file.file_id IS NOT NULL) AS local_present,
+        local_file.relative_path AS local_relative_path,
+        local_file.destination_path AS local_destination_path,
         drive_match.drive_file_id,
         drive_match.relative_path AS drive_relative_path,
         drive_match.match_confidence AS drive_match_confidence
@@ -254,11 +395,13 @@ WITH candidate_files AS NOT MATERIALIZED (
 ), with_presence AS (
     SELECT
         matched.*,
-        (drive_file_id IS NOT NULL) AS gdrive_present,
+        (drive_file_id IS NOT NULL AND drive_match_confidence='exact') AS gdrive_present,
         CASE
-            WHEN local_present AND drive_file_id IS NOT NULL THEN 'both'
+            WHEN local_present AND drive_file_id IS NOT NULL
+                 AND drive_match_confidence='exact' THEN 'both'
             WHEN local_present THEN 'local'
-            WHEN drive_file_id IS NOT NULL THEN 'gdrive'
+            WHEN drive_file_id IS NOT NULL AND drive_match_confidence='exact'
+                THEN 'gdrive'
             ELSE 'missing'
         END AS presence,
         CASE
@@ -267,18 +410,116 @@ WITH candidate_files AS NOT MATERIALIZED (
             ELSE 'none'
         END AS presence_confidence
     FROM matched
+), enriched AS (
+    SELECT
+        with_presence.*,
+        file_kind AS type,
+        CASE
+            WHEN CAST(%(site)s AS text)='local' THEN 'local'
+            ELSE site
+        END AS source,
+        CASE
+            WHEN local_present OR (
+                drive_file_id IS NOT NULL AND drive_match_confidence='exact'
+            ) THEN 'available'
+            ELSE 'cataloged'
+        END AS status,
+        CASE
+            WHEN CAST(%(site)s AS text)='local' THEN 'local'
+            WHEN site='gdrive' THEN 'gdrive'
+            ELSE 'torrent'
+        END AS location_kind,
+        CASE
+            WHEN CAST(%(site)s AS text)='local'
+                THEN COALESCE(local_relative_path, path)
+            WHEN site='gdrive'
+                THEN COALESCE(drive_relative_path, path)
+            ELSE path
+        END AS location,
+        CASE
+            WHEN local_present AND drive_file_id IS NOT NULL
+                 AND drive_match_confidence='exact' THEN 'both'
+            WHEN local_present THEN 'local'
+            WHEN drive_file_id IS NOT NULL AND drive_match_confidence='exact'
+                THEN 'gdrive'
+            ELSE 'torrent'
+        END AS location_group,
+        (
+            CASE WHEN site IN ('filecr','1337x')
+                THEN jsonb_build_array(jsonb_build_object(
+                    'source', site,
+                    'location_kind', 'torrent',
+                    'path', path,
+                    'status', 'cataloged'
+                ))
+                ELSE '[]'::jsonb
+            END
+            || CASE WHEN drive_file_id IS NOT NULL
+                THEN jsonb_build_array(jsonb_build_object(
+                    'source', 'gdrive',
+                    'location_kind', 'gdrive',
+                    'path', COALESCE(drive_relative_path, path),
+                    'status', CASE drive_match_confidence
+                        WHEN 'exact' THEN 'available'
+                        ELSE 'possible'
+                    END,
+                    'confidence', drive_match_confidence,
+                    'drive_file_id', drive_file_id
+                ))
+                ELSE '[]'::jsonb
+            END
+            || CASE WHEN local_present
+                THEN jsonb_build_array(jsonb_build_object(
+                    'source', 'local',
+                    'location_kind', 'local',
+                    'path', COALESCE(local_relative_path, path),
+                    'destination_path', local_destination_path,
+                    'status', 'available'
+                ))
+                ELSE '[]'::jsonb
+            END
+        ) AS locations
+    FROM with_presence
 ), selected AS (
     SELECT *
-    FROM with_presence
+    FROM enriched
     WHERE
-        CAST(%(presence)s AS text) IS NULL
-        OR (CAST(%(presence)s AS text)='local' AND local_present)
-        OR (CAST(%(presence)s AS text)='gdrive' AND drive_file_id IS NOT NULL)
-        OR (CAST(%(presence)s AS text)='not_gdrive' AND drive_file_id IS NULL)
-        OR (CAST(%(presence)s AS text)='both' AND local_present AND drive_file_id IS NOT NULL)
-        OR (CAST(%(presence)s AS text)='missing' AND NOT local_present AND drive_file_id IS NULL)
-        OR (CAST(%(presence)s AS text) IN ('exact','possible')
-            AND presence_confidence=CAST(%(presence)s AS text))
+        (CAST(%(site)s AS text) IS NULL
+         OR CAST(%(site)s AS text)<>'local'
+         OR local_present)
+        AND (
+            CAST(%(presence)s AS text) IS NULL
+            OR (CAST(%(presence)s AS text)='local' AND local_present)
+            OR (CAST(%(presence)s AS text)='gdrive'
+                AND drive_file_id IS NOT NULL AND drive_match_confidence='exact')
+            OR (CAST(%(presence)s AS text)='not_gdrive'
+                AND (drive_file_id IS NULL OR drive_match_confidence<>'exact'))
+            OR (CAST(%(presence)s AS text)='both' AND local_present
+                AND drive_file_id IS NOT NULL AND drive_match_confidence='exact')
+            OR (CAST(%(presence)s AS text)='missing' AND NOT local_present
+                AND (drive_file_id IS NULL OR drive_match_confidence<>'exact'))
+            OR (CAST(%(presence)s AS text) IN ('exact','possible')
+                AND presence_confidence=CAST(%(presence)s AS text))
+        )
+        AND (CAST(%(status)s AS text) IS NULL
+             OR status=CAST(%(status)s AS text))
+), groupable AS (
+    SELECT
+        CASE CAST(%(group_by)s AS text)
+            WHEN 'type' THEN type
+            WHEN 'status' THEN status
+            WHEN 'source' THEN source
+            WHEN 'presence' THEN presence
+            WHEN 'location' THEN location_group
+            ELSE NULL
+        END AS group_key,
+        size
+    FROM selected
+), grouped AS (
+    SELECT group_key,count(*) AS file_count,COALESCE(sum(size), 0) AS bytes_total
+    FROM groupable
+    WHERE group_key IS NOT NULL
+    GROUP BY group_key
 )
 SELECT
     (SELECT count(*) FROM selected) AS total_count,
@@ -295,7 +536,22 @@ SELECT
             ) page_rows
         ),
         '[]'::jsonb
-    ) AS items
+    ) AS items,
+    COALESCE(
+        (
+            SELECT jsonb_agg(
+                jsonb_build_object(
+                    'key', group_key,
+                    'label', group_key,
+                    'count', file_count,
+                    'files', file_count,
+                    'bytes', bytes_total
+                ) ORDER BY group_key
+            )
+            FROM grouped
+        ),
+        '[]'::jsonb
+    ) AS groups
 """
 
 
@@ -353,15 +609,21 @@ class Page:
     total: int
     page: int
     page_size: int
+    groups: list[dict[str, Any]] = field(default_factory=list)
+    group_by: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "items": self.items,
             "total": self.total,
             "page": self.page,
             "page_size": self.page_size,
             "pages": (self.total + self.page_size - 1) // self.page_size,
         }
+        if self.group_by is not None:
+            payload["group_by"] = self.group_by
+            payload["groups"] = self.groups
+        return payload
 
 
 def _validated_optional(value: str | None, allowed: Sequence[str] | set[str], name: str) -> str | None:
@@ -429,6 +691,93 @@ def _json_object(value: Any, name: str) -> dict[str, Any]:
     return dict(value)
 
 
+def _source_filter(site: str | None, source: str | None) -> str | None:
+    selected_site = _validated_optional(site, EXPLORER_SITES, "site")
+    selected_source = _validated_optional(source, EXPLORER_SITES, "source")
+    if (
+        selected_site is not None
+        and selected_source is not None
+        and selected_site != selected_source
+    ):
+        raise ValueError("site e source conflitantes")
+    return selected_source or selected_site
+
+
+def _integer(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _item_contract(item: dict[str, Any], selected_source: str | None) -> dict[str, Any]:
+    """Add UI aliases without replacing the canonical inventory fields."""
+
+    site = str(item.get("site") or "")
+    local_present = bool(item.get("local_present"))
+    drive_candidate = bool(item.get("drive_file_id"))
+    drive_confidence = str(
+        item.get("presence_confidence")
+        or item.get("drive_match_confidence")
+        or "exact"
+    )
+    drive_present = bool(
+        item.get("gdrive_present")
+        or (drive_candidate and drive_confidence != "possible")
+    )
+    source = "local" if selected_source == "local" else site
+    item.setdefault("source", source)
+    item.setdefault("type", item.get("file_kind") or "other")
+    item.setdefault("status", "available" if local_present or drive_present else "cataloged")
+
+    if selected_source == "local":
+        location_kind = "local"
+        location = item.get("local_relative_path") or item.get("path")
+    elif site == "gdrive":
+        location_kind = "gdrive"
+        location = item.get("drive_relative_path") or item.get("path")
+    else:
+        location_kind = "torrent"
+        location = item.get("path")
+    item.setdefault("location_kind", location_kind)
+    item.setdefault("location", location)
+
+    if "locations" not in item:
+        locations: list[dict[str, Any]] = []
+        if site in {"filecr", "1337x"}:
+            locations.append(
+                {
+                    "source": site,
+                    "location_kind": "torrent",
+                    "path": item.get("path"),
+                    "status": "cataloged",
+                }
+            )
+        if drive_candidate or drive_present:
+            locations.append(
+                {
+                    "source": "gdrive",
+                    "location_kind": "gdrive",
+                    "path": item.get("drive_relative_path") or item.get("path"),
+                    "status": "available" if drive_present else "possible",
+                    "confidence": drive_confidence,
+                    "drive_file_id": item.get("drive_file_id"),
+                }
+            )
+        if local_present:
+            locations.append(
+                {
+                    "source": "local",
+                    "location_kind": "local",
+                    "path": item.get("local_relative_path") or item.get("path"),
+                    "destination_path": item.get("local_destination_path"),
+                    "status": "available",
+                }
+            )
+        item["locations"] = locations
+    return item
+
+
 class InventoryService:
     """Read-only inventory queries independent from the HTTP framework.
 
@@ -445,7 +794,17 @@ class InventoryService:
         sources = _json_object(
             row.get("torrent_sources_by_site"), "torrent_sources_by_site"
         )
+        source_types = _json_object(
+            row.get("source_types_by_source"), "source_types_by_source"
+        )
+        source_transfers = _json_object(
+            row.get("source_transfers_by_source"), "source_transfers_by_source"
+        )
+        files_by_kind = _json_object(row.get("files_by_kind"), "files_by_kind")
         row["torrent_sources_by_site"] = sources
+        row["source_types_by_source"] = source_types
+        row["source_transfers_by_source"] = source_transfers
+        row["files_by_kind"] = files_by_kind
         # Proveniencia e presenca sao dimensoes diferentes: um arquivo de
         # torrent pode estar simultaneamente local e no Drive. Manter os
         # dominios separados evita que consumidores somem copias fisicas ao
@@ -468,6 +827,103 @@ class InventoryService:
                 "bytes": int(row.get("gdrive_bytes_total") or 0),
             },
         }
+        active_states = TRANSFER_STATES - {"completed", "failed", "cancelled"}
+        cards: list[dict[str, Any]] = []
+        for source in SOURCE_CARDS:
+            source_stat = sources.get(source)
+            if not isinstance(source_stat, Mapping):
+                source_stat = {}
+            if source == "gdrive":
+                titles = _integer(row.get("gdrive_title_count"))
+                files = _integer(row.get("gdrive_file_count"))
+                bytes_total = _integer(row.get("gdrive_bytes_total"))
+            elif source == "local":
+                titles = _integer(row.get("local_title_count"))
+                files = _integer(row.get("local_file_count"))
+                bytes_total = _integer(row.get("local_bytes_total"))
+            else:
+                titles = _integer(source_stat.get("titles"))
+                files = _integer(source_stat.get("files"))
+                bytes_total = _integer(source_stat.get("bytes"))
+
+            raw_types = source_types.get(source)
+            types: dict[str, dict[str, int]] = {}
+            if isinstance(raw_types, Mapping):
+                for kind in FILE_KINDS:
+                    metrics = raw_types.get(kind)
+                    if isinstance(metrics, Mapping) and _integer(metrics.get("count")):
+                        types[kind] = {
+                            "count": _integer(metrics.get("count")),
+                            "bytes": _integer(metrics.get("bytes")),
+                        }
+
+            raw_states = source_transfers.get(source)
+            states: dict[str, int] = {}
+            if isinstance(raw_states, Mapping):
+                states = {
+                    str(state): _integer(count)
+                    for state, count in raw_states.items()
+                    if _integer(count)
+                }
+            active_transfers = sum(states.get(state, 0) for state in active_states)
+            label, location, location_kind = SOURCE_METADATA[source]
+            cards.append(
+                {
+                    "source": source,
+                    "label": label,
+                    "status": "busy" if active_transfers else ("ready" if files else "empty"),
+                    "selectable": True,
+                    "location": location,
+                    "location_kind": location_kind,
+                    "titles": titles,
+                    "files": files,
+                    "bytes": bytes_total,
+                    "types": types,
+                    "active_transfers": active_transfers,
+                    "transfers_by_state": states,
+                    "query": {"source": source},
+                }
+            )
+        row["source_cards"] = cards
+
+        type_filters: list[dict[str, Any]] = []
+        for kind in FILE_KINDS:
+            metrics = files_by_kind.get(kind)
+            if not isinstance(metrics, Mapping) or not _integer(metrics.get("count")):
+                continue
+            type_filters.append(
+                {
+                    "value": kind,
+                    "label": kind.replace("_", " ").title(),
+                    "count": _integer(metrics.get("count")),
+                    "bytes": _integer(metrics.get("bytes")),
+                }
+            )
+        row["filters"] = {
+            "sources": [
+                {
+                    "value": card["source"],
+                    "label": card["label"],
+                    "count": card["files"],
+                    "bytes": card["bytes"],
+                    "status": card["status"],
+                }
+                for card in cards
+            ],
+            "types": type_filters,
+            "statuses": [
+                {"value": "available", "label": "Disponivel"},
+                {"value": "cataloged", "label": "Catalogado"},
+            ],
+            "presences": [
+                {"value": value, "label": value.replace("_", " ").title()}
+                for value in sorted(PRESENCE_FILTERS)
+            ],
+            "group_by": [
+                {"value": value, "label": value.replace("_", " ").title()}
+                for value in ("type", "status", "source", "presence", "location")
+            ],
+        }
         return row
 
     def explorer(
@@ -475,26 +931,39 @@ class InventoryService:
         *,
         q: str | None = None,
         site: str | None = None,
+        source: str | None = None,
         kind: str | None = None,
         presence: str | None = None,
+        status: str | None = None,
+        group_by: str | None = None,
         page: int = 1,
         page_size: int = 50,
     ) -> Page:
         selected_page, selected_size, limit, offset = _pagination(page, page_size)
+        selected_source = _source_filter(site, source)
+        selected_group = _validated_optional(group_by, EXPLORER_GROUPS, "group_by")
         params = {
             "q": _like_pattern(q),
-            "site": _validated_optional(site, EXPLORER_SITES, "site"),
+            "site": selected_source,
             "kind": _validated_optional(kind, set(FILE_KINDS), "kind"),
             "presence": _validated_optional(presence, PRESENCE_FILTERS, "presence"),
+            "status": _validated_optional(status, EXPLORER_STATUSES, "status"),
+            "group_by": selected_group,
             "limit": limit,
             "offset": offset,
         }
         row = _mapping(self.database.execute(EXPLORER_SQL, params).fetchone())
+        items = [
+            _item_contract(item, selected_source)
+            for item in _json_list(row.get("items"))
+        ]
         return Page(
-            items=_json_list(row.get("items")),
+            items=items,
             total=int(row.get("total_count") or 0),
             page=selected_page,
             page_size=selected_size,
+            groups=_json_list(row.get("groups")),
+            group_by=selected_group,
         )
 
     def transfers(

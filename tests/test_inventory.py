@@ -186,6 +186,8 @@ def test_explorer_is_parameterized_and_reports_possible_presence():
         "site": "1337x",
         "kind": "video",
         "presence": "possible",
+        "status": None,
+        "group_by": None,
         "limit": 25,
         "offset": 25,
     }
@@ -210,9 +212,53 @@ def test_drive_visibility_and_not_gdrive_filter_are_explicit_sql_contracts():
     sql, params = database.calls[0]
     assert page.total == 0
     assert params["presence"] == "not_gdrive"
-    assert "CAST(%(presence)s AS text)='not_gdrive' AND drive_file_id IS NULL" in sql
+    assert "CAST(%(presence)s AS text)='not_gdrive'" in sql
+    assert "drive_match_confidence<>'exact'" in sql
     assert "own_drive.active AND own_drive.can_download" in sql
     assert "d.active AND d.can_download" in DASHBOARD_SQL
+
+
+def test_local_presence_requires_classified_target_and_matching_manifest():
+    database = FakeDatabase({"total_count": 0, "items": []})
+    InventoryService(database).explorer(source="local", page=1, page_size=10)
+
+    sql, params = database.calls[0]
+    assert params["site"] == "local"
+    assert "local_job.target='local'" in sql
+    assert "WITH ORDINALITY AS local_manifest" in sql
+    assert "NULLIF(local_manifest.value->>'local_path','') IS NOT NULL" in sql
+    assert "local_job.destination_path" in sql
+    assert "persistent_local.file_id IS NOT NULL" in sql
+    assert "job.target='local'" in DASHBOARD_SQL
+    assert "WITH ORDINALITY AS local_manifest" in DASHBOARD_SQL
+
+
+def test_possible_drive_match_is_not_promoted_to_confirmed_availability():
+    database = FakeDatabase(
+        {
+            "total_count": 1,
+            "items": [
+                {
+                    "file_id": 9,
+                    "site": "filecr",
+                    "infohash": "a" * 40,
+                    "path": "arquivo.bin",
+                    "file_kind": "other",
+                    "drive_file_id": "possible-drive-id",
+                    "drive_relative_path": "arquivo.bin",
+                    "drive_match_confidence": "possible",
+                    "local_present": False,
+                }
+            ],
+        }
+    )
+
+    item = InventoryService(database).explorer(page=1, page_size=10).items[0]
+
+    assert item["status"] == "cataloged"
+    assert item["locations"][-1]["status"] == "possible"
+    assert item["locations"][-1]["confidence"] == "possible"
+    assert "drive_match_confidence='exact'" in EXPLORER_SQL
 
 
 def test_video_catalog_counts_only_downloadable_active_drive_files():
@@ -240,7 +286,17 @@ def test_dashboard_and_transfer_queries_do_not_need_flask_or_postgres():
             "gdrive_file_count": 5,
             "gdrive_bytes_total": 500,
             "gdrive_title_count": 4,
-            "files_by_kind": {"video": {"count": 2}},
+            "files_by_kind": {"video": {"count": 2, "bytes": 900}},
+            "source_types_by_source": {
+                "filecr": {"video": {"count": 19, "bytes": 600}},
+                "1337x": {"archive": {"count": 10, "bytes": 400}},
+                "gdrive": {"video": {"count": 5, "bytes": 500}},
+                "local": {"video": {"count": 3, "bytes": 300}},
+            },
+            "source_transfers_by_source": {
+                "filecr": {"downloading": 1},
+                "local": {"completed": 2},
+            },
             "torrent_sources_by_site": {
                 "filecr": {
                     "titles": 6,
@@ -269,6 +325,32 @@ def test_dashboard_and_transfer_queries_do_not_need_flask_or_postgres():
         "local": {"titles": 2, "files": 3, "bytes": 300},
         "gdrive": {"titles": 4, "files": 5, "bytes": 500},
     }
+    assert [card["source"] for card in dashboard["source_cards"]] == [
+        "gdrive",
+        "filecr",
+        "1337x",
+        "local",
+    ]
+    filecr_card = dashboard["source_cards"][1]
+    assert filecr_card == {
+        "source": "filecr",
+        "label": "FileCR",
+        "status": "busy",
+        "selectable": True,
+        "location": "Catalogo FileCR",
+        "location_kind": "torrent",
+        "titles": 6,
+        "files": 19,
+        "bytes": 600,
+        "types": {"video": {"count": 19, "bytes": 600}},
+        "active_transfers": 1,
+        "transfers_by_state": {"downloading": 1},
+        "query": {"source": "filecr"},
+    }
+    assert dashboard["filters"]["sources"][0]["value"] == "gdrive"
+    assert dashboard["filters"]["types"] == [
+        {"value": "video", "label": "Video", "count": 2, "bytes": 900}
+    ]
     transfers = service.list_transfers(
         state="queued",
         target="gdrive",
@@ -336,6 +418,92 @@ def test_explorer_virtual_torrent_site_groups_real_torrent_sources_only():
     assert "t.site IN ('filecr','1337x')" in sql
 
 
+def test_local_source_exposes_original_and_physical_locations_and_type_groups():
+    database = FakeDatabase(
+        {
+            "total_count": 1,
+            "items": [
+                {
+                    "file_id": 44,
+                    "site": "filecr",
+                    "file_kind": "video",
+                    "path": "Release/Season 01/Episode 01.mkv",
+                    "local_present": True,
+                    "local_relative_path": "Release/Season 01/Episode 01.mkv",
+                    "local_destination_path": "video/Series/Example",
+                    "drive_file_id": "drive_file_12345",
+                    "drive_relative_path": "Series/Example/Season 01/Episode 01.mkv",
+                }
+            ],
+            "groups": [
+                {
+                    "key": "video",
+                    "label": "video",
+                    "count": 1,
+                    "files": 1,
+                    "bytes": 123,
+                }
+            ],
+        }
+    )
+
+    page = InventoryService(database).explorer(
+        source="LOCAL",
+        kind="video",
+        status="available",
+        group_by="type",
+        page_size=20,
+    )
+
+    item = page.items[0]
+    assert item["path"] == "Release/Season 01/Episode 01.mkv"
+    assert item["source"] == "local"
+    assert item["type"] == "video"
+    assert item["status"] == "available"
+    assert item["location_kind"] == "local"
+    assert item["location"] == "Release/Season 01/Episode 01.mkv"
+    assert item["drive_relative_path"] == "Series/Example/Season 01/Episode 01.mkv"
+    assert {location["source"] for location in item["locations"]} == {
+        "filecr",
+        "gdrive",
+        "local",
+    }
+    assert page.as_dict()["group_by"] == "type"
+    assert page.as_dict()["groups"][0]["key"] == "video"
+    _sql, params = database.calls[0]
+    assert params == {
+        "q": None,
+        "site": "local",
+        "kind": "video",
+        "presence": None,
+        "status": "available",
+        "group_by": "type",
+        "limit": 20,
+        "offset": 0,
+    }
+
+
+def test_explorer_source_status_and_group_filters_are_bounded():
+    service = InventoryService(FakeDatabase())
+
+    with pytest.raises(ValueError, match="conflitantes"):
+        service.explorer(site="filecr", source="local")
+    with pytest.raises(ValueError, match="status invalido"):
+        service.explorer(status="moving")
+    with pytest.raises(ValueError, match="group_by invalido"):
+        service.explorer(group_by="arbitrary_sql")
+
+
+def test_explorer_sql_keeps_logical_paths_separate_from_physical_locations():
+    assert "local_file.relative_path AS local_relative_path" in EXPLORER_SQL
+    assert "local_file.destination_path AS local_destination_path" in EXPLORER_SQL
+    assert "drive_match.relative_path AS drive_relative_path" in EXPLORER_SQL
+    assert "AS locations" in EXPLORER_SQL
+    assert "CAST(%(status)s AS text) IS NULL" in EXPLORER_SQL
+    assert "CASE CAST(%(group_by)s AS text)" in EXPLORER_SQL
+    assert "CAST(%(site)s AS text)='local'" in EXPLORER_SQL
+
+
 def test_transfer_site_filter_does_not_accept_virtual_torrent_site():
     service = InventoryService(FakeDatabase())
 
@@ -357,6 +525,8 @@ def test_nullable_filters_have_explicit_postgres_types():
     assert "CAST(%(kind)s AS text) IS NULL" in EXPLORER_SQL
     assert "CAST(%(q)s AS text) IS NULL" in EXPLORER_SQL
     assert "CAST(%(presence)s AS text) IS NULL" in EXPLORER_SQL
+    assert "CAST(%(status)s AS text) IS NULL" in EXPLORER_SQL
+    assert "CAST(%(group_by)s AS text)" in EXPLORER_SQL
     assert "CAST(%(state)s AS text) IS NULL" in TRANSFERS_SQL
     assert "CAST(%(target)s AS text) IS NULL" in TRANSFERS_SQL
     assert "CAST(%(infohash)s AS text) IS NULL" in TRANSFERS_SQL
