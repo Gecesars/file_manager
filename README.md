@@ -109,6 +109,49 @@ validar o runtime da GPU:
 docker compose -f compose.yaml -f compose.gpu.yaml up -d --build
 ```
 
+O perfil base fixa `libx264` e não solicita dispositivos GPU. O override de GPU
+é a única configuração que seleciona `h264_nvenc` e solicita as GPUs NVIDIA.
+
+### Orçamento de memória
+
+Os limites são tetos, não memória pré-alocada. A stack contínua tem teto de
+6,75 GiB; o container de migração pode acrescentar 512 MiB enquanto estiver ativo.
+
+| Serviço | Limite | Reserva |
+|---|---:|---:|
+| PostgreSQL | 1280 MiB | 384 MiB |
+| Redis | 384 MiB | 96 MiB |
+| migração, temporário | 512 MiB | 96 MiB |
+| sincronização de catálogo | 512 MiB | 128 MiB |
+| torrent engine | 1536 MiB | 384 MiB |
+| Google Drive | 512 MiB | 128 MiB |
+| transcoder | 2048 MiB | 256 MiB |
+| control | 512 MiB | 128 MiB |
+| gateway | 128 MiB | 32 MiB |
+
+O Redis limita os dados transitórios a 256 MiB e reserva o restante do teto para
+overhead do processo e picos de comandos. O PostgreSQL conserva suas regulagens
+de memória padrão dentro do teto de 1280 MiB; aumentos de `work_mem` devem levar
+em conta que o valor pode ser usado várias vezes por consulta e conexão.
+O catálogo verifica os SQLite a cada 600 segundos por padrão, reduzindo pressão
+de memória e I/O durante a convivência; configure `OFC_SYNC_INTERVAL=600` também
+em ambientes que já possuem `.env`.
+
+O sincronizador percorre torrents, arquivos, metadados e legendas em lotes de
+1.000 registros. Em runtime, `OFC_MAX_ACTIVE_TORRENTS=2` limita handles ativos;
+`OFC_MAX_TRANSCODES=1` com `OFC_MAX_TRANSCODE_QUEUE=1` admite uma codificação e
+uma espera; solicitações excedentes retornam `429` e podem ser repetidas. Apenas
+os últimos `OFC_FFMPEG_LOG_TAIL_BYTES=65536` bytes do log são lidos ao concluir
+um FFmpeg.
+
+Para convivência temporária com `ofc-media-v1-wsl`, mantenha projetos, portas e
+volumes distintos e não aplique novamente o Compose da stack antiga durante um
+job. Duas stacks no teto exigem 13,5 GiB, além do engine e de builds; não altere o
+limite global do Docker Desktop durante um job, pois essa operação reinicia o
+engine. Sem essa folga disponível ao Docker, suba primeiro apenas
+PostgreSQL, Redis e migração da stack nova e adie workers, playback e novos jobs
+até a transferência antiga chegar a um estado terminal verificado.
+
 ## Usando o painel
 
 ### Biblioteca

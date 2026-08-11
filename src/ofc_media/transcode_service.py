@@ -4,15 +4,17 @@ import hashlib
 import ipaddress
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import requests
 from flask import Flask, Response, jsonify, request, stream_with_context
@@ -32,6 +34,7 @@ CACHE_COMPLETE = ".complete.json"
 DEFAULT_PLAYBACK_TTL_SECONDS = 43_200
 LOOPBACK_SOURCE_PROXY = "http://127.0.0.1:7102/internal/source-proxy"
 CAPABILITY_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+PROCESS_TERMINATE_TIMEOUT_SECONDS = 5.0
 PROXY_RESPONSE_HEADERS = (
     "Accept-Ranges",
     "Content-Length",
@@ -40,6 +43,21 @@ PROXY_RESPONSE_HEADERS = (
     "ETag",
     "Last-Modified",
 )
+
+
+class TranscodeCapacityError(RuntimeError):
+    """Fila de transcode cheia; a solicitacao pode ser repetida depois."""
+
+
+def read_text_tail(path: Path, max_bytes: int) -> str:
+    """Decodifica somente a cauda limitada de um log potencialmente grande."""
+
+    limit = max(1, int(max_bytes))
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        size = handle.tell()
+        handle.seek(max(0, size - limit), os.SEEK_SET)
+        return handle.read(limit).decode("utf-8", errors="replace")
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,19 +85,88 @@ class TranscodeManager:
         self.cache_root = safe_owned_path(self.settings.hls_root, "cache")
         self.cache_root.mkdir(parents=True, exist_ok=True)
         self.media = MediaToolchain(settings.transcode_encoder)
-        self.slots = threading.Semaphore(settings.max_transcodes)
+        self.max_transcodes = max(1, int(settings.max_transcodes))
+        self.max_transcode_queue = max(
+            0, int(getattr(settings, "max_transcode_queue", 1))
+        )
+        self.log_tail_bytes = max(
+            4_096, int(getattr(settings, "ffmpeg_log_tail_bytes", 65_536))
+        )
+        self.slots = threading.BoundedSemaphore(self.max_transcodes)
+        self.admission = threading.BoundedSemaphore(
+            self.max_transcodes + self.max_transcode_queue
+        )
         self.jobs: dict[str, threading.Thread] = {}
         self.processes: dict[str, subprocess.Popen[bytes]] = {}
-        self.active_keys: set[str] = set()
+        self.running_jobs: set[str] = set()
+        self.active_keys: dict[str, str] = {}
         self.source_capabilities: dict[str, SourceCapability] = {}
         self.cancelled_sessions: set[str] = set()
         self.lock = threading.RLock()
 
     def details(self) -> dict[str, Any]:
+        with self.lock:
+            admitted = sum(thread.is_alive() for thread in self.jobs.values())
+            running = len(self.running_jobs)
+        capabilities = self.media.capabilities()
         return {
-            "active_jobs": sum(thread.is_alive() for thread in self.jobs.values()),
-            "capabilities": self.media.capabilities(),
+            "active_jobs": running,
+            "queued_jobs": max(0, admitted - running),
+            "admitted_jobs": admitted,
+            "max_transcodes": self.max_transcodes,
+            "max_transcode_queue": self.max_transcode_queue,
+            "capabilities": capabilities,
         }
+
+    @staticmethod
+    def _terminate_and_reap(
+        process: subprocess.Popen[bytes],
+        terminate_timeout: float = PROCESS_TERMINATE_TIMEOUT_SECONDS,
+    ) -> None:
+        """Encerra o filho e confirma seu reap antes de devolver capacidade."""
+
+        if process.poll() is not None:
+            return
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=max(0.0, float(terminate_timeout)))
+            return
+        except subprocess.TimeoutExpired:
+            LOG.warning("FFmpeg nao encerrou no prazo; aplicando kill")
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+    @contextmanager
+    def _transcode_slot(
+        self,
+        process_getter: Callable[[], subprocess.Popen[bytes] | None],
+    ) -> Iterator[None]:
+        self.slots.acquire()
+        try:
+            yield
+        finally:
+            process = process_getter()
+            if process is not None:
+                self._terminate_and_reap(process)
+            self.slots.release()
+
+    def _claim_cache_key(self, storage_key: str, job_id: str) -> bool:
+        with self.lock:
+            if storage_key in self.active_keys:
+                return False
+            self.active_keys[storage_key] = job_id
+            return True
+
+    def _release_cache_key(self, storage_key: str, job_id: str) -> None:
+        with self.lock:
+            if self.active_keys.get(storage_key) == job_id:
+                self.active_keys.pop(storage_key, None)
 
     def start(
         self,
@@ -91,19 +178,30 @@ class TranscodeManager:
         session_id = normalized_session_id(session_id)
         if not CAPABILITY_TOKEN_RE.fullmatch(token):
             raise UnsafeMediaError("capability de playback invalida")
+        if not self.admission.acquire(blocking=False):
+            raise TranscodeCapacityError(
+                "capacidade de transcode esgotada; tente novamente depois"
+            )
         job_id = uuid.uuid4().hex
         thread = threading.Thread(
             target=self._run,
-            args=(job_id, session_id, token, mode, quality_cap_bps),
+            args=(job_id, session_id, token, mode, quality_cap_bps, True),
             name=f"transcode-{session_id}",
             daemon=True,
         )
-        with self.lock:
-            if session_id in self.jobs and self.jobs[session_id].is_alive():
-                raise RuntimeError("transcodificacao ja ativa")
-            self.cancelled_sessions.discard(session_id)
-            self.jobs[session_id] = thread
-        thread.start()
+        try:
+            with self.lock:
+                if session_id in self.jobs and self.jobs[session_id].is_alive():
+                    raise RuntimeError("transcodificacao ja ativa")
+                self.cancelled_sessions.discard(session_id)
+                self.jobs[session_id] = thread
+            thread.start()
+        except Exception:
+            with self.lock:
+                if self.jobs.get(session_id) is thread:
+                    self.jobs.pop(session_id, None)
+            self.admission.release()
+            raise
         return job_id
 
     def _session(self, session_id: str) -> dict[str, Any]:
@@ -203,10 +301,14 @@ class TranscodeManager:
         token: str,
         mode: str,
         quality_cap_bps: int,
+        admission_owned: bool = False,
     ) -> None:
         process: subprocess.Popen[bytes] | None = None
+        owns_active_key = False
         try:
-            with self.slots:
+            with self._transcode_slot(lambda: process):
+                with self.lock:
+                    self.running_jobs.add(session_id)
                 item = self._session(session_id)
                 source_base = (
                     self.settings.drive_source_url
@@ -242,10 +344,8 @@ class TranscodeManager:
                 if self.media.ready(output, plan) and completion_marker.is_file():
                     self._register_ready(session_id, storage_key, plan, probe, cache_hit=True)
                     return
-                with self.lock:
-                    already_active = storage_key in self.active_keys
-                    if not already_active:
-                        self.active_keys.add(storage_key)
+                owns_active_key = self._claim_cache_key(storage_key, job_id)
+                already_active = not owns_active_key
                 if already_active:
                     for _ in range(600):
                         if self.media.ready(output, plan):
@@ -294,13 +394,13 @@ class TranscodeManager:
                         self._register_ready(session_id, storage_key, plan, probe, cache_hit=False)
                         break
                     if process.poll() is not None:
-                        error = log_path.read_text(encoding="utf-8", errors="replace")[-3000:]
+                        error = read_text_tail(log_path, self.log_tail_bytes)[-3000:]
                         raise RuntimeError(error or "FFmpeg encerrou antes do manifesto")
                     time.sleep(0.5)
                 else:
                     raise TimeoutError("manifesto HLS nao ficou pronto")
                 return_code = process.wait()
-                log_text = log_path.read_text(encoding="utf-8", errors="replace")
+                log_text = read_text_tail(log_path, self.log_tail_bytes)
                 premature = any(
                     marker in log_text.casefold()
                     for marker in (
@@ -337,8 +437,6 @@ class TranscodeManager:
                     database.commit()
         except Exception as exc:
             LOG.exception("transcode %s falhou", session_id)
-            if process is not None and process.poll() is None:
-                process.terminate()
             self._state(session_id, "error", f"{type(exc).__name__}: {exc}")
             with connection(self.settings) as database:
                 database.execute(
@@ -352,14 +450,16 @@ class TranscodeManager:
         finally:
             with self.lock:
                 self.processes.pop(session_id, None)
+                self.running_jobs.discard(session_id)
                 self.source_capabilities.pop(session_id, None)
                 self.cancelled_sessions.discard(session_id)
                 current = self.jobs.get(session_id)
                 if current is threading.current_thread():
                     self.jobs.pop(session_id, None)
-            if "storage_key" in locals():
-                with self.lock:
-                    self.active_keys.discard(storage_key)
+            if owns_active_key and "storage_key" in locals():
+                self._release_cache_key(storage_key, job_id)
+            if admission_owned:
+                self.admission.release()
 
     def _register_ready(
         self,
@@ -426,8 +526,8 @@ class TranscodeManager:
                 self.cancelled_sessions.add(session_id)
             self.source_capabilities.pop(session_id, None)
             process = self.processes.get(session_id)
-        if process is not None and process.poll() is None:
-            process.terminate()
+        if process is not None:
+            self._terminate_and_reap(process)
 
 
 def _internal(settings: Settings) -> bool:
@@ -460,6 +560,8 @@ def create_app() -> Flask:
                 str(payload.get("mode", "auto")),
                 int(payload.get("quality_cap_bps") or 0),
             )
+        except TranscodeCapacityError as exc:
+            return jsonify({"error": str(exc), "retryable": True}), 429
         except (UnsafeMediaError, ValueError, RuntimeError) as exc:
             return jsonify({"error": str(exc)}), 422
         return jsonify({"job_id": job_id}), 202

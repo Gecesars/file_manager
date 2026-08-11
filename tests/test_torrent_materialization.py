@@ -11,7 +11,12 @@ import pytest
 
 from ofc_media import torrent_service
 from ofc_media.safety import UnsafeMediaError, encode_bencode
-from ofc_media.torrent_service import StreamSession, TorrentEngine
+from ofc_media.torrent_service import (
+    Materialization,
+    StreamSession,
+    TorrentCapacityError,
+    TorrentEngine,
+)
 
 
 class FakeFiles:
@@ -337,15 +342,15 @@ def test_recovery_rematerializes_interrupted_job_with_fastresume_once(
     (engine.settings.resume_root / f"filecr-{infohash}.fastresume").write_bytes(
         resume_payload
     )
-    recovery_sql: list[str] = []
+    recovery_sql: list[tuple[str, object]] = []
 
     class RecoveryResult:
         def fetchall(self) -> list[dict[str, str]]:
             return [{"id": job_id}]
 
     class RecoveryDatabase:
-        def execute(self, sql: str) -> RecoveryResult:
-            recovery_sql.append(sql)
+        def execute(self, sql: str, params: object = None) -> RecoveryResult:
+            recovery_sql.append((sql, params))
             return RecoveryResult()
 
     @contextmanager
@@ -361,7 +366,11 @@ def test_recovery_rematerializes_interrupted_job_with_fastresume_once(
     assert len(engine.engine.added) == 1
     assert job_id in engine.materializations
     assert updates[-1]["state"] == "downloading"
-    assert "('queued','validating','downloading')" in recovery_sql[0]
+    assert "('queued','validating','downloading')" in recovery_sql[0][0]
+    assert "LIMIT %s" in recovery_sql[0][0]
+    assert recovery_sql[0][1] == ([], 2)
+    assert "LIMIT %s" in recovery_sql[1][0]
+    assert recovery_sql[1][1] == ([job_id], 32)
 
 
 def test_recovery_loop_survives_transient_scan_failure(tmp_path: Path):
@@ -380,6 +389,217 @@ def test_recovery_loop_survives_transient_scan_failure(tmp_path: Path):
     engine._recovery_loop(0)
 
     assert attempts == 2
+
+
+def test_capacity_rejection_leaves_queued_materialization_untouched(tmp_path: Path):
+    torrent_root = tmp_path / "torrents"
+    _path, infohash, torrent_info = make_metainfo(
+        torrent_root, [("payload.bin", 3)]
+    )
+    engine = make_engine(tmp_path, torrent_info)
+    engine.settings.max_active_torrents = 1
+    engine.materializations["existing"] = Materialization(
+        id="existing",
+        download_key="filecr-" + "f" * 40,
+        target="local",
+        files=(),
+        bytes_total=0,
+    )
+    job_id = str(uuid.uuid4())
+    updates: list[dict[str, object]] = []
+    install_job(
+        engine,
+        job_id=job_id,
+        infohash=infohash,
+        rows=[{"id": 7, "path": "payload.bin", "size": 3}],
+        updates=updates,
+    )
+
+    with pytest.raises(TorrentCapacityError, match="capacidade"):
+        engine.materialize(job_id)
+
+    assert updates == []
+    assert job_id not in engine.materializations
+    assert getattr(engine, "materialization_admissions", {}) == {}
+
+
+def test_recovery_requests_only_free_slots_and_excludes_active_jobs(tmp_path: Path):
+    engine = make_engine(tmp_path, FakeTorrentInfo([("bundle/file.bin", 1)]))
+    engine.settings.max_active_torrents = 3
+    active_id = str(uuid.uuid4())
+    engine.materializations[active_id] = Materialization(
+        id=active_id,
+        download_key="filecr-" + "f" * 40,
+        target="local",
+        files=(),
+        bytes_total=0,
+    )
+    scans: list[tuple[str, int, tuple[str, ...]]] = []
+
+    def materialization_scan(limit: int, excluded: tuple[str, ...]) -> list[str]:
+        scans.append(("materialize", limit, excluded))
+        return []
+
+    def completion_scan(limit: int, excluded: tuple[str, ...]) -> list[str]:
+        scans.append(("complete", limit, excluded))
+        return []
+
+    engine._recoverable_materialization_ids = materialization_scan
+    engine._recoverable_local_completion_ids = completion_scan
+
+    assert engine._recover_materializations_once() == 0
+    assert scans == [
+        ("materialize", 2, (active_id,)),
+        ("complete", 32, (active_id,)),
+    ]
+
+
+def test_conditional_progress_update_uses_row_state_guard(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    engine = make_engine(tmp_path, FakeTorrentInfo([("bundle/file.bin", 1)]))
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    class Result:
+        def fetchone(self) -> None:
+            return None
+
+    class Database:
+        def execute(self, sql: str, params: tuple[object, ...]) -> Result:
+            calls.append((sql, params))
+            return Result()
+
+        def commit(self) -> None:
+            return None
+
+    @contextmanager
+    def fake_connection(_settings: object):
+        yield Database()
+
+    monkeypatch.setattr(torrent_service, "connection", fake_connection)
+    updated = engine._write_transfer_progress(
+        str(uuid.uuid4()),
+        state="downloading",
+        bytes_total=10,
+        bytes_done=3,
+        local_files=[],
+        expected_states=("validating", "downloading"),
+    )
+    cancelled = engine._cancel_transfer_job(str(uuid.uuid4()))
+
+    assert updated is False
+    assert cancelled is False
+    assert "state=ANY(%s::text[])" in calls[0][0]
+    assert "RETURNING state" in calls[0][0]
+    assert calls[0][1][-1] == ["validating", "downloading"]
+    assert "bytes_done" not in calls[1][0]
+    assert "state=ANY(%s::text[])" in calls[1][0]
+
+
+def test_cancel_during_validation_cannot_resurrect_materialization(tmp_path: Path):
+    torrent_root = tmp_path / "torrents"
+    _path, infohash, torrent_info = make_metainfo(
+        torrent_root, [("payload.bin", 3)]
+    )
+    engine = make_engine(tmp_path, torrent_info)
+    job_id = str(uuid.uuid4())
+    rows = [{"id": 7, "path": "payload.bin", "size": 3}]
+    job = {
+        "id": job_id,
+        "source_site": "filecr",
+        "infohash": infohash,
+        "target": "gdrive",
+        "state": "queued",
+        "selected_file_ids": [7],
+        "metainfo_relpath": "bundle.torrent",
+    }
+    persisted: dict[str, object] = {
+        **job,
+        "bytes_total": 0,
+        "bytes_done": 0,
+        "local_files": [],
+        "error": None,
+    }
+    state_lock = threading.Lock()
+    validated = threading.Event()
+    resume_validation = threading.Event()
+    engine._lookup_transfer_job = lambda _job_id: (job, rows)
+
+    def read_status(_job_id: str) -> dict[str, object]:
+        with state_lock:
+            return dict(persisted)
+
+    def conditional_write(_job_id: str, **values: object) -> bool:
+        expected = tuple(values.pop("expected_states", ()))
+        with state_lock:
+            if expected and persisted["state"] not in expected:
+                return False
+            persisted.update(values)
+            return True
+
+    def conditional_cancel(_job_id: str) -> bool:
+        with state_lock:
+            if persisted["state"] not in torrent_service.CANCELLABLE_TRANSFER_STATES:
+                return False
+            persisted["state"] = "cancelled"
+            persisted["error"] = None
+            return True
+
+    engine._read_transfer_status = read_status
+    engine._write_transfer_progress = conditional_write
+    engine._cancel_transfer_job = conditional_cancel
+    engine._write_transfer_error = lambda *_args, **_kwargs: True
+    original_validation = engine._validated_materialization
+
+    def blocking_validation(*args: object):
+        result = original_validation(*args)
+        validated.set()
+        assert resume_validation.wait(2)
+        return result
+
+    engine._validated_materialization = blocking_validation
+    results: list[Materialization | None] = []
+    failures: list[BaseException] = []
+
+    def run_materialize() -> None:
+        try:
+            results.append(engine.materialize(job_id))
+        except BaseException as exc:  # pragma: no cover - torna a falha legivel
+            failures.append(exc)
+
+    worker = threading.Thread(target=run_materialize)
+    worker.start()
+    assert validated.wait(2)
+
+    cancelled = engine.cancel_materialization(job_id)
+    resume_validation.set()
+    worker.join(2)
+
+    assert not worker.is_alive()
+    assert failures == []
+    assert results and results[0] is not None
+    assert cancelled["state"] == "cancelled"
+    assert persisted["state"] == "cancelled"
+    assert job_id not in engine.materializations
+    assert engine.downloads == {}
+    assert engine.engine.removed == [engine.handle]
+    assert getattr(engine, "materialization_admissions", {}) == {}
+
+
+def test_recovery_stops_at_capacity_and_keeps_remaining_jobs_queued(tmp_path: Path):
+    engine = make_engine(tmp_path, FakeTorrentInfo([("bundle/file.bin", 1)]))
+    calls: list[str] = []
+    engine._recoverable_materialization_ids = lambda *_args: ["first", "second"]
+    engine._recoverable_local_completion_ids = lambda *_args: []
+
+    def at_capacity(job_id: str) -> None:
+        calls.append(job_id)
+        raise TorrentCapacityError("cheio")
+
+    engine.materialize = at_capacity
+
+    assert engine._recover_materializations_once() == 0
+    assert calls == ["first"]
 
 
 @pytest.mark.parametrize(
@@ -423,8 +643,8 @@ def test_recovery_finishes_validated_local_manifest_from_each_intermediate_state
     }
     updates: list[dict[str, object]] = []
     errors: list[str] = []
-    engine._recoverable_materialization_ids = lambda: []
-    engine._recoverable_local_completion_ids = lambda: [job_id]
+    engine._recoverable_materialization_ids = lambda *_args: []
+    engine._recoverable_local_completion_ids = lambda *_args: [job_id]
     engine._read_transfer_status = lambda _job_id: status
     engine._write_transfer_progress = (
         lambda _job_id, **values: updates.append(dict(values))
@@ -466,8 +686,8 @@ def test_recovery_marks_local_job_failed_when_manifest_escapes_media_root(
         ],
     }
     errors: list[str] = []
-    engine._recoverable_materialization_ids = lambda: []
-    engine._recoverable_local_completion_ids = lambda: [job_id]
+    engine._recoverable_materialization_ids = lambda *_args: []
+    engine._recoverable_local_completion_ids = lambda *_args: [job_id]
     engine._read_transfer_status = lambda _job_id: status
     engine._write_transfer_progress = lambda *_args, **_kwargs: pytest.fail(
         "manifesto inseguro nao deve avancar"
@@ -512,6 +732,7 @@ def test_internal_materialization_endpoints_are_authenticated_and_idempotent(
 ):
     token = "I" * 32
     job_id = str(uuid.uuid4())
+    full_job_id = str(uuid.uuid4())
 
     class FakeEngine:
         sessions: dict[str, object] = {}
@@ -522,6 +743,8 @@ def test_internal_materialization_endpoints_are_authenticated_and_idempotent(
 
         def materialize(self, value: str) -> None:
             self.calls.append(("post", value))
+            if value == full_job_id:
+                raise TorrentCapacityError("cheio")
 
         def materialization_status(self, value: str) -> dict[str, object]:
             self.calls.append(("get", value))
@@ -553,13 +776,19 @@ def test_internal_materialization_endpoints_are_authenticated_and_idempotent(
     )
     fetched = client.get(f"/internal/materializations/{job_id}", headers=headers)
     cancelled = client.delete(f"/internal/materializations/{job_id}", headers=headers)
+    rejected = client.post(
+        "/internal/materializations", json={"job_id": full_job_id}, headers=headers
+    )
 
     assert created.status_code == 202
     assert fetched.get_json()["state"] == "downloading"
     assert cancelled.get_json()["state"] == "cancelled"
+    assert rejected.status_code == 429
+    assert rejected.get_json()["retryable"] is True
     assert fake.calls == [
         ("post", job_id),
         ("get", job_id),
         ("get", job_id),
         ("delete", job_id),
+        ("post", full_job_id),
     ]

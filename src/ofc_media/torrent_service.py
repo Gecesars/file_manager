@@ -35,6 +35,23 @@ from .safety import (
 LOG = logging.getLogger("ofc.torrent_engine")
 DEFAULT_PLAYBACK_TTL_SECONDS = 43_200
 MATERIALIZATION_RECOVERY_INTERVAL = 5.0
+LOCAL_COMPLETION_RECOVERY_BATCH_SIZE = 32
+MATERIALIZATION_STATES = ("queued", "validating", "downloading")
+MATERIALIZATION_PROGRESS_STATES = ("validating", "downloading")
+CANCELLABLE_TRANSFER_STATES = (
+    "queued",
+    "validating",
+    "downloading",
+    "downloaded",
+    "classifying",
+    "uploading",
+    "verifying",
+)
+TERMINAL_TRANSFER_STATES = {"completed", "failed", "cancelled"}
+
+
+class TorrentCapacityError(RuntimeError):
+    """Capacidade transitória esgotada; o chamador pode tentar novamente."""
 
 
 def _normalized_job_id(value: str) -> str:
@@ -121,6 +138,10 @@ class TorrentEngine:
         self.sessions: dict[str, StreamSession] = {}
         self.materializations: dict[str, Materialization] = {}
         self.lock = threading.RLock()
+        self.max_active_torrents = max(
+            1, int(getattr(settings, "max_active_torrents", 2))
+        )
+        self.materialization_admissions: dict[str, str] = {}
         self.stop = threading.Event()
         self.monitor = threading.Thread(target=self._monitor, name="torrent-monitor", daemon=True)
         self.recovery = threading.Thread(
@@ -137,6 +158,72 @@ class TorrentEngine:
         if site == "1337x":
             return self.settings.x1337_torrent_root
         raise UnsafeMediaError("site invalido")
+
+    def _capacity_limit(self) -> int:
+        """Retorna o limite inclusive para instancias legadas criadas via __new__."""
+
+        configured = getattr(self, "max_active_torrents", None)
+        if configured is None:
+            configured = getattr(self.settings, "max_active_torrents", 2)
+        return max(1, int(configured))
+
+    def _materialization_admissions_locked(self) -> dict[str, str]:
+        """Inicializa o estado novo de forma preguiçosa para fixtures legadas."""
+
+        admissions = getattr(self, "materialization_admissions", None)
+        if admissions is None:
+            admissions = {}
+            self.materialization_admissions = admissions
+        return admissions
+
+    def _effective_download_keys_locked(self) -> set[str]:
+        admissions = self._materialization_admissions_locked()
+        return set(self.downloads) | set(admissions.values())
+
+    def _ensure_download_capacity_locked(self, key: str) -> None:
+        effective = self._effective_download_keys_locked()
+        if key not in effective and len(effective) >= self._capacity_limit():
+            raise TorrentCapacityError(
+                "capacidade de torrents ativos esgotada; tente novamente depois"
+            )
+
+    def _admit_materialization(self, job_id: str, key: str) -> None:
+        with self.lock:
+            admissions = self._materialization_admissions_locked()
+            if job_id in admissions:
+                raise TorrentCapacityError("materializacao ja esta sendo admitida")
+            if (
+                len(self.materializations) + len(admissions)
+                >= self._capacity_limit()
+            ):
+                raise TorrentCapacityError(
+                    "capacidade de materializacoes esgotada; tente novamente depois"
+                )
+            self._ensure_download_capacity_locked(key)
+            admissions[job_id] = key
+
+    def _release_materialization_admission(self, job_id: str) -> None:
+        with self.lock:
+            self._materialization_admissions_locked().pop(job_id, None)
+
+    def capacity_details(self) -> dict[str, int]:
+        with self.lock:
+            effective = self._effective_download_keys_locked()
+            admitted = len(self._materialization_admissions_locked())
+            active_materializations = len(self.materializations)
+            capacity_limit = self._capacity_limit()
+            return {
+                "sessions": len(self.sessions),
+                "active_torrents": len(self.downloads),
+                "reserved_torrents": max(0, len(effective) - len(self.downloads)),
+                "materializations": active_materializations,
+                "materialization_admissions": admitted,
+                "max_active_torrents": capacity_limit,
+                "available_materialization_slots": max(
+                    0,
+                    capacity_limit - active_materializations - admitted,
+                ),
+            }
 
     def _lookup(self, session_id: str) -> dict[str, Any]:
         with connection(self.settings) as database:
@@ -235,7 +322,11 @@ class TorrentEngine:
             result["updated_at"] = updated_at.isoformat()
         return result
 
-    def _recoverable_materialization_ids(self) -> list[str]:
+    def _recoverable_materialization_ids(
+        self,
+        limit: int,
+        exclude_ids: Sequence[str] = (),
+    ) -> list[str]:
         """Lista jobs torrent interrompidos sem reivindicar ou alterar estado.
 
         ``materialize`` faz a validacao e possui a secao critica idempotente. A
@@ -253,12 +344,19 @@ class TorrentEngine:
                   ON t.site=j.source_site AND t.infohash=j.infohash AND t.active
                 WHERE j.source_site IN ('filecr','1337x')
                   AND j.state IN ('queued','validating','downloading')
+                  AND NOT (j.id=ANY(%s::uuid[]))
                 ORDER BY j.updated_at,j.id
-                """
+                LIMIT %s
+                """,
+                (list(exclude_ids), max(1, int(limit))),
             ).fetchall()
         return [_normalized_job_id(str(row["id"])) for row in rows]
 
-    def _recoverable_local_completion_ids(self) -> list[str]:
+    def _recoverable_local_completion_ids(
+        self,
+        limit: int = LOCAL_COMPLETION_RECOVERY_BATCH_SIZE,
+        exclude_ids: Sequence[str] = (),
+    ) -> list[str]:
         with connection(self.settings) as database:
             rows = database.execute(
                 """
@@ -266,8 +364,11 @@ class TorrentEngine:
                 FROM runtime.transfer_jobs
                 WHERE source_site IN ('filecr','1337x') AND target='local'
                   AND state IN ('downloaded','classifying','verifying')
+                  AND NOT (id=ANY(%s::uuid[]))
                 ORDER BY updated_at,id
-                """
+                LIMIT %s
+                """,
+                (list(exclude_ids), max(1, int(limit))),
             ).fetchall()
         return [_normalized_job_id(str(row["id"])) for row in rows]
 
@@ -370,20 +471,43 @@ class TorrentEngine:
             "classifying": ("verifying", "completed"),
             "verifying": ("completed",),
         }[state]
+        current_state = state
         for next_state in transitions:
-            self._write_transfer_progress(
+            updated = self._write_transfer_progress(
                 job_id,
                 state=next_state,
                 bytes_total=total,
                 bytes_done=total,
                 local_files=local_files,
                 error=None,
+                expected_states=(current_state,),
             )
+            # Outro worker (ou um cancelamento) venceu o lock da linha. Nao
+            # tente forcar a proxima transicao com uma leitura ja obsoleta.
+            if updated is False:
+                return False
+            current_state = next_state
         return True
 
     def _recover_materializations_once(self) -> int:
         recovered = 0
-        for job_id in self._recoverable_materialization_ids():
+        with self.lock:
+            excluded = tuple(
+                set(self.materializations)
+                | set(self._materialization_admissions_locked())
+            )
+            available_slots = max(
+                0,
+                self._capacity_limit()
+                - len(self.materializations)
+                - len(self._materialization_admissions_locked()),
+            )
+        recoverable_ids = (
+            self._recoverable_materialization_ids(available_slots, excluded)
+            if available_slots
+            else []
+        )
+        for job_id in recoverable_ids:
             if self.stop.is_set():
                 break
             with self.lock:
@@ -394,6 +518,10 @@ class TorrentEngine:
                 # impede um segundo handle quando o POST inicial corre em paralelo.
                 item = self.materialize(job_id)
                 recovered += int(item is not None)
+            except TorrentCapacityError:
+                # Capacidade cheia e um estado esperado. Jobs permanecem na
+                # fila e o proximo ciclo recomeca pelo mais antigo.
+                break
             except (KeyError, OSError, RuntimeError, UnsafeMediaError) as exc:
                 LOG.warning(
                     "materializacao %s nao recuperada (%s); novo ciclo tentara novamente",
@@ -404,7 +532,12 @@ class TorrentEngine:
                 # Falhas transitorias de PostgreSQL/Redis nao podem encerrar o
                 # reconciliador nem impedir que os demais jobs sejam tentados.
                 LOG.exception("falha transitoria ao recuperar materializacao %s", job_id)
-        for job_id in self._recoverable_local_completion_ids():
+        with self.lock:
+            completion_excluded = tuple(self.materializations)
+        for job_id in self._recoverable_local_completion_ids(
+            LOCAL_COMPLETION_RECOVERY_BATCH_SIZE,
+            completion_excluded,
+        ):
             if self.stop.is_set():
                 break
             with self.lock:
@@ -442,36 +575,84 @@ class TorrentEngine:
         bytes_done: int,
         local_files: Sequence[dict[str, object]],
         error: str | None = None,
-    ) -> None:
-        with connection(self.settings) as database:
-            database.execute(
-                """
-                UPDATE runtime.transfer_jobs SET state=%s,bytes_total=%s,
-                  bytes_done=%s,local_files=%s,error=%s,updated_at=now()
-                WHERE id=%s
-                """,
-                (
-                    state,
-                    max(0, int(bytes_total)),
-                    max(0, min(int(bytes_done), int(bytes_total))),
-                    Jsonb(list(local_files)),
-                    error,
-                    job_id,
-                ),
+        expected_states: Sequence[str] | None = None,
+    ) -> bool:
+        normalized_expected = tuple(
+            dict.fromkeys(
+                str(value).strip().casefold()
+                for value in (expected_states or ())
+                if str(value).strip()
             )
+        )
+        with connection(self.settings) as database:
+            params: tuple[object, ...] = (
+                state,
+                max(0, int(bytes_total)),
+                max(0, min(int(bytes_done), int(bytes_total))),
+                Jsonb(list(local_files)),
+                error,
+                job_id,
+            )
+            if expected_states is None:
+                database.execute(
+                    """
+                    UPDATE runtime.transfer_jobs SET state=%s,bytes_total=%s,
+                      bytes_done=%s,local_files=%s,error=%s,updated_at=now()
+                    WHERE id=%s
+                    """,
+                    params,
+                )
+                updated = True
+            else:
+                if not normalized_expected:
+                    raise ValueError("estados esperados ausentes")
+                # UPDATE adquire lock da linha e reavalia o predicado depois
+                # de um concorrente liberar o lock. Assim cancelled/completed
+                # nunca sao ressuscitados, e o trigger ve apenas transicoes
+                # permitidas a partir do estado realmente persistido.
+                row = database.execute(
+                    """
+                    UPDATE runtime.transfer_jobs SET state=%s,bytes_total=%s,
+                      bytes_done=%s,local_files=%s,error=%s,updated_at=now()
+                    WHERE id=%s AND state=ANY(%s::text[])
+                    RETURNING state
+                    """,
+                    (*params, list(normalized_expected)),
+                ).fetchone()
+                updated = row is not None
             database.commit()
+        return updated
 
-    def _write_transfer_error(self, job_id: str, error: BaseException | str) -> None:
+    def _write_transfer_error(self, job_id: str, error: BaseException | str) -> bool:
         message = str(error).strip()[:2000] or type(error).__name__
         with connection(self.settings) as database:
-            database.execute(
+            row = database.execute(
                 """
                 UPDATE runtime.transfer_jobs
-                SET state='failed',error=%s,updated_at=now() WHERE id=%s
+                SET state='failed',error=%s,updated_at=now()
+                WHERE id=%s AND state=ANY(%s::text[])
+                RETURNING state
                 """,
-                (message, job_id),
-            )
+                (message, job_id, list(CANCELLABLE_TRANSFER_STATES)),
+            ).fetchone()
             database.commit()
+        return row is not None
+
+    def _cancel_transfer_job(self, job_id: str) -> bool:
+        """Cancela sem regravar contadores obtidos por uma leitura obsoleta."""
+
+        with connection(self.settings) as database:
+            row = database.execute(
+                """
+                UPDATE runtime.transfer_jobs
+                SET state='cancelled',error=NULL,updated_at=now()
+                WHERE id=%s AND state=ANY(%s::text[])
+                RETURNING state
+                """,
+                (job_id, list(CANCELLABLE_TRANSFER_STATES)),
+            ).fetchone()
+            database.commit()
+        return row is not None
 
     def add(self, session_id: str) -> StreamSession:
         session_id = normalized_session_id(session_id)
@@ -505,6 +686,7 @@ class TorrentEngine:
         with self.lock:
             shared = self.downloads.get(key)
             if shared is None:
+                self._ensure_download_capacity_locked(key)
                 shared = self._add_download(
                     key, site, infohash, torrent_info, {file_index}
                 )
@@ -633,70 +815,83 @@ class TorrentEngine:
         job_state = str(job.get("state") or "").casefold()
         if job_state == "downloaded":
             return None
-        if job_state == "queued":
-            self._write_transfer_progress(
-                job_id,
-                state="validating",
-                bytes_total=int(job.get("bytes_total") or 0),
-                bytes_done=int(job.get("bytes_done") or 0),
-                local_files=list(job.get("local_files") or []),
-                error=None,
-            )
-            job_state = "validating"
-        if job_state not in {"validating", "downloading"}:
+        if job_state not in MATERIALIZATION_STATES:
             raise UnsafeMediaError(
                 f"job nao pode ser materializado no estado {job_state or 'ausente'}"
             )
-        try:
-            torrent_info, files = self._validated_materialization(
-                job, inventory_files
-            )
-        except (UnsafeMediaError, OSError, RuntimeError) as exc:
-            try:
-                self._write_transfer_error(job_id, exc)
-            except Exception:
-                LOG.exception("falha de validacao do job %s nao foi persistida", job_id)
-            raise
         site = str(job["source_site"]).strip().casefold()
         infohash = normalized_infohash(str(job["infohash"]))
         key = f"{site}-{infohash}"
-        selected_indices = {item.file_index for item in files}
-        item = Materialization(
-            id=job_id,
-            download_key=key,
-            target=str(job["target"]),
-            files=files,
-            bytes_total=sum(value.file_size for value in files),
-        )
-        with self.lock:
-            existing = self.materializations.get(job_id)
-            if existing is not None:
-                return existing
-            shared = self.downloads.get(key)
-            if shared is None:
-                shared = self._add_download(
-                    key, site, infohash, torrent_info, selected_indices
-                )
-                self.downloads[key] = shared
-            else:
-                shared.selected_indices.update(selected_indices)
-                self._apply_file_priorities(shared)
-            shared.materializations.add(job_id)
-            self.materializations[job_id] = item
+        self._admit_materialization(job_id, key)
         try:
-            state, bytes_done, local_files = self._materialization_snapshot(item)
-            persisted_state = self._persist_materialization_snapshot(
-                item,
-                state=state,
-                bytes_done=bytes_done,
-                local_files=local_files,
+            if job_state == "queued":
+                claimed = self._write_transfer_progress(
+                    job_id,
+                    state="validating",
+                    bytes_total=int(job.get("bytes_total") or 0),
+                    bytes_done=int(job.get("bytes_done") or 0),
+                    local_files=list(job.get("local_files") or []),
+                    error=None,
+                    expected_states=("queued",),
+                )
+                if claimed is False:
+                    return None
+                job_state = "validating"
+            try:
+                torrent_info, files = self._validated_materialization(
+                    job, inventory_files
+                )
+            except (UnsafeMediaError, OSError, RuntimeError) as exc:
+                try:
+                    self._write_transfer_error(job_id, exc)
+                except Exception:
+                    LOG.exception(
+                        "falha de validacao do job %s nao foi persistida", job_id
+                    )
+                raise
+            selected_indices = {value.file_index for value in files}
+            item = Materialization(
+                id=job_id,
+                download_key=key,
+                target=str(job["target"]),
+                files=files,
+                bytes_total=sum(value.file_size for value in files),
             )
-        except Exception:
-            self._release_materialization(job_id)
-            raise
-        if persisted_state in {"downloaded", "completed"}:
-            self._release_materialization(job_id)
-        return item
+            with self.lock:
+                existing = self.materializations.get(job_id)
+                if existing is not None:
+                    return existing
+                # A reserva vira uma materializacao ativa na mesma secao
+                # critica, sem contar o mesmo job duas vezes.
+                self._materialization_admissions_locked().pop(job_id, None)
+                shared = self.downloads.get(key)
+                if shared is None:
+                    self._ensure_download_capacity_locked(key)
+                    shared = self._add_download(
+                        key, site, infohash, torrent_info, selected_indices
+                    )
+                    self.downloads[key] = shared
+                else:
+                    shared.selected_indices.update(selected_indices)
+                    self._apply_file_priorities(shared)
+                shared.materializations.add(job_id)
+                self.materializations[job_id] = item
+            try:
+                state, bytes_done, local_files = self._materialization_snapshot(item)
+                persisted_state = self._persist_materialization_snapshot(
+                    item,
+                    state=state,
+                    bytes_done=bytes_done,
+                    local_files=local_files,
+                )
+            except Exception:
+                self._release_materialization(job_id)
+                raise
+            if persisted_state not in MATERIALIZATION_PROGRESS_STATES:
+                self._release_materialization(job_id)
+            return item
+        finally:
+            self._release_materialization_admission(job_id)
 
     def _materialization_snapshot(
         self, item: Materialization
@@ -743,22 +938,37 @@ class TorrentEngine:
         bytes_done: int,
         local_files: Sequence[dict[str, object]],
     ) -> str:
-        self._write_transfer_progress(
+        expected_states = (
+            ("validating", "downloading", "downloaded")
+            if state == "downloaded"
+            else MATERIALIZATION_PROGRESS_STATES
+        )
+        updated = self._write_transfer_progress(
             item.id,
             state=state,
             bytes_total=item.bytes_total,
             bytes_done=bytes_done,
             local_files=local_files,
+            expected_states=expected_states,
         )
+        if updated is False:
+            return str(self._read_transfer_status(item.id)["state"]).casefold()
         if state == "downloaded" and item.target == "local":
+            current_state = "downloaded"
             for final_state in ("classifying", "verifying", "completed"):
-                self._write_transfer_progress(
+                advanced = self._write_transfer_progress(
                     item.id,
                     state=final_state,
                     bytes_total=item.bytes_total,
                     bytes_done=bytes_done,
                     local_files=local_files,
+                    expected_states=(current_state,),
                 )
+                if advanced is False:
+                    return str(
+                        self._read_transfer_status(item.id)["state"]
+                    ).casefold()
+                current_state = final_state
             return "completed"
         return state
 
@@ -774,7 +984,7 @@ class TorrentEngine:
             bytes_done=bytes_done,
             local_files=local_files,
         )
-        if persisted_state in {"downloaded", "completed"}:
+        if persisted_state not in MATERIALIZATION_PROGRESS_STATES:
             self._release_materialization(job_id)
         return self._read_transfer_status(job_id)
 
@@ -893,24 +1103,17 @@ class TorrentEngine:
                 bytes_done=bytes_done,
                 local_files=local_files,
                 error=None,
+                expected_states=(
+                    ("validating", "downloading", "downloaded")
+                    if state == "downloaded"
+                    else CANCELLABLE_TRANSFER_STATES
+                ),
             )
             self._release_materialization(job_id)
         else:
             status = self._read_transfer_status(job_id)
-            if status["state"] not in {
-                "downloaded",
-                "completed",
-                "failed",
-                "cancelled",
-            }:
-                self._write_transfer_progress(
-                    job_id,
-                    state="cancelled",
-                    bytes_total=status["bytes_total"],
-                    bytes_done=status["bytes_done"],
-                    local_files=status["local_files"],
-                    error=None,
-                )
+            if status["state"] not in TERMINAL_TRANSFER_STATES | {"downloaded"}:
+                self._cancel_transfer_job(job_id)
         return self._read_transfer_status(job_id)
 
     def get(self, session_id: str) -> tuple[StreamSession, SharedDownload]:
@@ -1089,6 +1292,7 @@ class TorrentEngine:
             downloads = tuple(self.downloads.values())
             self.sessions.clear()
             self.materializations.clear()
+            self._materialization_admissions_locked().clear()
             self.downloads.clear()
         for shared in downloads:
             self._save_resume(shared)
@@ -1127,12 +1331,21 @@ def create_app() -> Flask:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     settings = Settings.from_env()
     engine = TorrentEngine(settings)
+
+    def capacity_details() -> dict[str, int]:
+        details = getattr(engine, "capacity_details", None)
+        if callable(details):
+            return details()
+        # Compatibilidade com adaptadores/fixtures que implementam o contrato
+        # anterior do engine sem telemetria de capacidade.
+        return {
+            "sessions": len(getattr(engine, "sessions", {})),
+            "materializations": len(getattr(engine, "materializations", {})),
+        }
+
     start_heartbeat(
         "torrent-engine",
-        lambda: {
-            "sessions": len(engine.sessions),
-            "materializations": len(engine.materializations),
-        },
+        capacity_details,
     )
     atexit.register(engine.close_all)
     app = Flask(__name__)
@@ -1140,14 +1353,7 @@ def create_app() -> Flask:
 
     @app.get("/health")
     def health() -> Response:
-        return jsonify(
-            {
-                "status": "ok",
-                "engine": True,
-                "sessions": len(engine.sessions),
-                "materializations": len(engine.materializations),
-            }
-        )
+        return jsonify({"status": "ok", "engine": True, **capacity_details()})
 
     @app.post("/internal/sessions")
     def create_session() -> Response:
@@ -1156,6 +1362,8 @@ def create_app() -> Flask:
         payload = request.get_json(silent=True) or {}
         try:
             item = engine.add(str(payload.get("session_id", "")))
+        except TorrentCapacityError as exc:
+            return jsonify({"error": str(exc), "retryable": True}), 429
         except (KeyError, UnsafeMediaError, OSError, RuntimeError) as exc:
             return jsonify({"error": str(exc)}), 422
         return jsonify(
@@ -1195,6 +1403,8 @@ def create_app() -> Flask:
             normalized = _normalized_job_id(job_id)
             engine.materialize(normalized)
             status = engine.materialization_status(normalized)
+        except TorrentCapacityError as exc:
+            return jsonify({"error": str(exc), "retryable": True}), 429
         except KeyError:
             return jsonify({"error": "job ausente"}), 404
         except (UnsafeMediaError, OSError, RuntimeError) as exc:

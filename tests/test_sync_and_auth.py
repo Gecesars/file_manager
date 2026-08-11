@@ -12,6 +12,7 @@ import ofc_media.catalog_sync as catalog_sync
 from ofc_media.auth import token_digest, token_matches
 from ofc_media.catalog_sync import (
     CatalogSynchronizer,
+    _canonical_file_stream,
     _canonical_file_rows,
     _cleanup_stale_snapshots,
     _relative_metainfo,
@@ -67,6 +68,225 @@ def test_duplicate_torrent_path_is_rejected_before_database_write():
         _canonical_file_rows([row, dict(row)])
 
 
+def test_canonical_file_stream_is_lazy_and_buffers_only_one_torrent():
+    consumed = 0
+
+    def rows() -> Iterator[dict[str, Any]]:
+        nonlocal consumed
+        for index in range(10_000):
+            consumed += 1
+            yield {
+                "infohash": f"{index:040x}",
+                "path": f"files/{index}.bin",
+                "size": index,
+            }
+
+    stream = _canonical_file_stream(rows())
+
+    assert next(stream)["infohash"] == "0" * 40
+    assert consumed == 2
+
+
+def test_canonical_file_stream_preserves_indices_and_rejects_duplicates():
+    infohash = "a" * 40
+    canonical = list(
+        _canonical_file_stream(
+            iter(
+                [
+                    {"infohash": infohash, "path": "Season/Zeta.MKV", "size": 3},
+                    {"infohash": infohash, "path": "Season/a.srt", "size": 1},
+                    {"infohash": infohash, "path": "Season/data.csv", "size": 2},
+                    {"infohash": "b" * 40, "path": "movie.mp4", "size": 4},
+                ]
+            )
+        )
+    )
+
+    assert [(item["path"], item["file_index"]) for item in canonical] == [
+        ("Season/a.srt", 0),
+        ("Season/data.csv", 1),
+        ("Season/Zeta.MKV", 2),
+        ("movie.mp4", 0),
+    ]
+    duplicate = {"infohash": infohash, "path": "same/file.mkv", "size": 10}
+    with pytest.raises(ValueError, match="duplicado"):
+        list(_canonical_file_stream(iter([duplicate, dict(duplicate)])))
+
+
+@pytest.mark.parametrize(
+    ("method_name", "site"),
+    [("_sync_filecr", "filecr"), ("_sync_1337x", "1337x")],
+)
+def test_large_source_sync_passes_lazy_iterators_to_upserts(
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+    site: str,
+):
+    class FakeSource:
+        def __init__(self) -> None:
+            self.queries: list[str] = []
+            self.closed = False
+
+        def execute(self, sql: str) -> Iterator[dict[str, Any]]:
+            self.queries.append(sql)
+            if len(self.queries) == 1:
+                return iter(
+                    [
+                        {
+                            "infohash": "a" * 40,
+                            "local_path": "release.torrent",
+                        }
+                    ]
+                )
+            return iter(
+                [
+                    {"infohash": "a" * 40, "path": "video.mkv", "size": 10},
+                    {"infohash": "a" * 40, "path": "subtitle.srt", "size": 2},
+                ]
+            )
+
+        def close(self) -> None:
+            self.closed = True
+
+    source = FakeSource()
+    synchronizer = CatalogSynchronizer(SimpleNamespace())
+    seen: dict[str, Any] = {}
+
+    monkeypatch.setattr(synchronizer, "_open", lambda _path: source)
+    monkeypatch.setattr(synchronizer, "_start_run", lambda *_args: "run")
+    monkeypatch.setattr(
+        synchronizer,
+        "_finish_run",
+        lambda _run, selected_site, _stat, counts: {
+            **counts,
+            "site": selected_site,
+        },
+    )
+
+    def upsert_torrents(selected_site: str, rows: Any) -> int:
+        assert selected_site == site
+        assert not isinstance(rows, list)
+        assert source.closed is False
+        payload = list(rows)
+        seen["torrents"] = payload
+        return len(payload)
+
+    def upsert_files(
+        selected_site: str,
+        rows: Any,
+        *,
+        ordered_by_infohash: bool = False,
+    ) -> int:
+        assert selected_site == site
+        assert not isinstance(rows, list)
+        assert ordered_by_infohash is True
+        assert source.closed is False
+        payload = list(rows)
+        seen["files"] = payload
+        return len(payload)
+
+    monkeypatch.setattr(synchronizer, "_upsert_torrents", upsert_torrents)
+    monkeypatch.setattr(synchronizer, "_upsert_files", upsert_files)
+    monkeypatch.setattr(synchronizer, "_sample_swarm", lambda: None)
+
+    result = getattr(synchronizer, method_name)(
+        Path("snapshot.sqlite3"), SimpleNamespace()
+    )
+
+    assert result == {"torrents": 1, "files": 2, "site": site}
+    assert len(seen["torrents"]) == 1
+    assert len(seen["files"]) == 2
+    assert "ORDER BY lower(trim(infohash))" in source.queries[1]
+    assert source.closed is True
+
+
+@pytest.mark.parametrize(
+    ("method_name", "source_table", "count_key"),
+    [
+        ("_sync_metadata", "catalog_metadata", "metadata"),
+        ("_sync_subtitles", "subtitle_jobs", "subtitles"),
+    ],
+)
+def test_metadata_and_subtitle_sync_stream_rows_in_bounded_batches(
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+    source_table: str,
+    count_key: str,
+):
+    produced = 0
+
+    class FakeSource:
+        closed = False
+
+        def execute(self, sql: str) -> Iterator[dict[str, Any]]:
+            assert sql == f"SELECT * FROM {source_table}"
+
+            def rows() -> Iterator[dict[str, Any]]:
+                nonlocal produced
+                for index in range(2_505):
+                    produced += 1
+                    yield {
+                        "site": "1337x",
+                        "infohash": f"{index:040x}",
+                        "torrent_path": f"files/{index}.mkv",
+                        "language": "pt-BR",
+                        "active": index % 2,
+                    }
+
+            return rows()
+
+        def close(self) -> None:
+            self.closed = True
+
+    class FakeDatabase:
+        committed = False
+
+        def commit(self) -> None:
+            self.committed = True
+
+    source = FakeSource()
+    database = FakeDatabase()
+    batch_sizes: list[int] = []
+
+    @contextmanager
+    def fake_connection(_settings: Any) -> Iterator[FakeDatabase]:
+        # Opening the destination must not have consumed the SQLite cursor.
+        assert produced == 0
+        yield database
+        # The source cursor remains valid for the complete batch import.
+        assert source.closed is False
+
+    def fake_execute_batches(_database: Any, sql: str, batches: Any) -> None:
+        assert _database is database
+        assert "INSERT INTO catalog." in sql
+        assert produced == 0
+        for batch in batches:
+            assert source.closed is False
+            assert 0 < len(batch) <= 1_000
+            batch_sizes.append(len(batch))
+
+    synchronizer = CatalogSynchronizer(SimpleNamespace())
+    monkeypatch.setattr(synchronizer, "_open", lambda _path: source)
+    monkeypatch.setattr(synchronizer, "_start_run", lambda *_args: "run")
+    monkeypatch.setattr(
+        synchronizer,
+        "_finish_run",
+        lambda _run, _source, _stat, counts: counts,
+    )
+    monkeypatch.setattr(catalog_sync, "connection", fake_connection)
+    monkeypatch.setattr(catalog_sync, "_execute_batches", fake_execute_batches)
+
+    result = getattr(synchronizer, method_name)(
+        Path("snapshot.sqlite3"), SimpleNamespace()
+    )
+
+    assert result == {count_key: 2_505}
+    assert batch_sizes == [1_000, 1_000, 505]
+    assert produced == 2_505
+    assert database.committed is True
+    assert source.closed is True
+
+
 def test_file_upsert_uses_canonical_columns_and_preserves_known_hash(monkeypatch):
     class FakeDatabase:
         committed = False
@@ -94,11 +314,12 @@ def test_file_upsert_uses_canonical_columns_and_preserves_known_hash(monkeypatch
     monkeypatch.setattr(catalog_sync, "connection", fake_connection)
     monkeypatch.setattr(catalog_sync, "_execute_batches", fake_execute_batches)
     synchronizer = CatalogSynchronizer(SimpleNamespace())
-    synchronizer._upsert_files(
+    count = synchronizer._upsert_files(
         "1337x",
         [{"infohash": "a" * 40, "path": "movie.MP4", "size": 99}],
     )
 
+    assert count == 1
     assert database.committed is True
     assert captured["values"] == [
         (7, 0, "movie.MP4", ".mp4", "video", "video/mp4", 99, True, False, None)

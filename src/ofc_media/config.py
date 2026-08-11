@@ -34,6 +34,9 @@ class Settings:
     sync_interval: int
     transcode_encoder: str
     max_transcodes: int
+    max_transcode_queue: int
+    ffmpeg_log_tail_bytes: int
+    max_active_torrents: int
     vendor_hls_path: Path
     subtitle_file_root: Path
     subtitle_host_root: str
@@ -85,9 +88,14 @@ class Settings:
             media_root=Path(os.environ.get("MEDIA_ROOT", "/media")),
             resume_root=Path(os.environ.get("RESUME_ROOT", "/resume")),
             hls_root=Path(os.environ.get("HLS_ROOT", "/hls")),
-            sync_interval=_integer("OFC_SYNC_INTERVAL", 120, 30),
-            transcode_encoder=os.environ.get("OFC_TRANSCODE_ENCODER", "auto"),
+            sync_interval=_integer("OFC_SYNC_INTERVAL", 600, 30),
+            transcode_encoder=os.environ.get("OFC_TRANSCODE_ENCODER", "libx264"),
             max_transcodes=_integer("OFC_MAX_TRANSCODES", 1, 1),
+            max_transcode_queue=_integer("OFC_MAX_TRANSCODE_QUEUE", 1, 0),
+            ffmpeg_log_tail_bytes=_integer(
+                "OFC_FFMPEG_LOG_TAIL_BYTES", 65_536, 4_096
+            ),
+            max_active_torrents=_integer("OFC_MAX_ACTIVE_TORRENTS", 2, 1),
             vendor_hls_path=Path(os.environ.get("VENDOR_HLS_PATH", "/app/vendor/hls.mjs")),
             subtitle_file_root=Path(
                 os.environ.get("SUBTITLE_FILE_ROOT", "/subtitle-files")

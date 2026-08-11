@@ -14,6 +14,7 @@ from ofc_media.control import (
     ControlPlane,
     LargeTransferConfirmationRequired,
     MAX_TRANSFER_FILES,
+    PlaybackCapacityError,
     _selected_file_ids,
 )
 from ofc_media.safety import UnsafeMediaError
@@ -384,6 +385,55 @@ def test_playback_selection_requires_active_downloadable_drive_file(
     assert "d.active AND d.can_download" in selection_sql
 
 
+def test_transcode_capacity_closes_source_and_persisted_playback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = QueueDatabase(FakeResult(row={"id": 4}))
+    install_connection(monkeypatch, database)
+    posts: list[str] = []
+    deletes: list[str] = []
+
+    def fake_post(url: str, **_kwargs: Any) -> OkResponse:
+        posts.append(url)
+        return OkResponse(status_code=429 if url.endswith("/internal/transcodes") else 200)
+
+    def fake_delete(url: str, **_kwargs: Any) -> OkResponse:
+        deletes.append(url)
+        return OkResponse()
+
+    monkeypatch.setattr(control.requests, "post", fake_post)
+    monkeypatch.setattr(control.requests, "delete", fake_delete)
+    plane = bare_plane(
+        torrent_engine_url="http://torrent",
+        drive_source_url="http://drive",
+        transcoder_url="http://transcoder",
+        session_pepper="p" * 32,
+    )
+
+    with pytest.raises(PlaybackCapacityError, match="transcodificacao"):
+        plane.create_playback(
+            site="filecr",
+            infohash=INFOHASH,
+            file_id=4,
+            mode="adaptive",
+            quality_cap_bps=0,
+        )
+
+    assert posts == [
+        "http://torrent/internal/sessions",
+        "http://transcoder/internal/transcodes",
+    ]
+    session_id = deletes[0].rsplit("/", 1)[-1]
+    assert deletes == [
+        f"http://transcoder/internal/transcodes/{session_id}",
+        f"http://torrent/internal/sessions/{session_id}",
+    ]
+    sql = "\n".join(call[0] for call in database.calls)
+    assert "SET state='closed',error=" in sql
+    assert "UPDATE runtime.download_jobs SET state='closed'" in sql
+    assert "UPDATE runtime.transcode_jobs" in sql
+
+
 def test_gdrive_to_local_carries_remote_manifest_without_torrent_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -548,7 +598,9 @@ def test_http_routes_keep_security_headers_and_translate_errors(
         def catalog(self, **_kwargs: Any) -> dict[str, Any]:
             return {"items": [], "total": 0}
 
-        def create_playback(self, **_kwargs: Any) -> dict[str, str]:
+        def create_playback(self, **kwargs: Any) -> dict[str, str]:
+            if kwargs.get("file_id") == 429:
+                raise PlaybackCapacityError("capacidade temporaria")
             return {"id": "b" * 32, "token": "capability"}
 
         def sync_drive(self) -> dict[str, bool]:
@@ -609,6 +661,17 @@ def test_http_routes_keep_security_headers_and_translate_errors(
     assert client.get("/api/catalog?page=nao-inteiro").status_code == 400
     assert client.post("/api/playback", json={}).status_code == 422
     assert client.post("/api/playback", json=[]).status_code == 422
+    playback_capacity = client.post(
+        "/api/playback",
+        json={
+            "site": "filecr",
+            "infohash": INFOHASH,
+            "file_id": 429,
+            "mode": "adaptive",
+        },
+    )
+    assert playback_capacity.status_code == 429
+    assert playback_capacity.get_json()["retryable"] is True
     denied = client.get(f"/api/playback/{'b' * 32}/subtitles/{'c' * 24}.vtt")
     allowed = client.get(
         f"/api/playback/{'b' * 32}/subtitles/{'c' * 24}.vtt?token=ok"
@@ -668,3 +731,37 @@ def test_dispatch_failure_marks_job_failed(monkeypatch: pytest.MonkeyPatch):
         )
 
     assert any("SET state='failed'" in sql for sql, _ in database.calls)
+
+
+def test_capacity_defers_queued_transfer_without_marking_it_failed(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    database = TransferDatabase(
+        [
+            {
+                "id": 4,
+                "path": "file.bin",
+                "file_kind": "other",
+                "mime_type": "application/octet-stream",
+                "size": 1,
+            }
+        ]
+    )
+    install_connection(monkeypatch, database)
+    monkeypatch.setattr(
+        control.requests,
+        "post",
+        lambda *_args, **_kwargs: OkResponse(status_code=429),
+    )
+
+    result = bare_plane(torrent_engine_url="http://torrent").create_transfer(
+        site="1337x", infohash=INFOHASH, target="local", file_ids=[4]
+    )
+
+    assert result["state"] == "queued"
+    assert result["deferred"] is True
+    assert not any("SET state='failed'" in sql for sql, _ in database.calls)
+    assert any(
+        params and "transfer.dispatch_deferred" in params
+        for _sql, params in database.calls
+    )

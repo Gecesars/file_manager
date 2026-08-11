@@ -73,6 +73,10 @@ class LargeTransferConfirmationRequired(ValueError):
         self.bytes_total = bytes_total
 
 
+class PlaybackCapacityError(RuntimeError):
+    """Capacidade temporaria esgotada antes de iniciar o playback."""
+
+
 def _page_payload(page: Any) -> dict[str, Any]:
     payload = page.as_dict()
     payload["per_page"] = payload["page_size"]
@@ -518,6 +522,19 @@ class ControlPlane:
                 json={"job_id": str(job_id)},
                 timeout=30,
             )
+            if response.status_code == 429:
+                with connection(self.settings) as database:
+                    self._audit(
+                        database,
+                        action="transfer.dispatch_deferred",
+                        entity_type="transfer_job",
+                        entity_id=str(job_id),
+                        correlation_id=job_id,
+                        details={"reason": "torrent_capacity"},
+                    )
+                    database.commit()
+                result["deferred"] = True
+                return result
             response.raise_for_status()
         except requests.RequestException as exc:
             message = f"torrent-engine indisponivel: {exc}"[:2000]
@@ -649,6 +666,10 @@ class ControlPlane:
                 json={"session_id": session_id},
                 timeout=30,
             )
+            if source_response.status_code == 429:
+                raise PlaybackCapacityError(
+                    "capacidade de torrents esgotada; tente novamente depois"
+                )
             source_response.raise_for_status()
             transcode_response = requests.post(
                 f"{self.settings.transcoder_url}/internal/transcodes",
@@ -661,14 +682,41 @@ class ControlPlane:
                 },
                 timeout=30,
             )
+            if transcode_response.status_code == 429:
+                raise PlaybackCapacityError(
+                    "capacidade de transcodificacao esgotada; tente novamente depois"
+                )
             transcode_response.raise_for_status()
-        except requests.RequestException as exc:
+        except (PlaybackCapacityError, requests.RequestException) as exc:
+            # A origem pode ter sido aberta antes de o transcoder recusar o
+            # trabalho. Encerrar ambos os lados evita reter handle de torrent,
+            # token e slot ate o TTL da sessao.
+            self._stop_workers(session_id, site)
             with connection(self.settings) as database:
                 database.execute(
-                    "UPDATE runtime.playback_sessions SET state='error',error=%s,updated_at=now() WHERE id=%s",
+                    """
+                    UPDATE runtime.playback_sessions
+                    SET state='closed',error=%s,closed_at=now(),updated_at=now()
+                    WHERE id=%s
+                    """,
                     (f"servico interno: {exc}", session_uuid),
                 )
+                database.execute(
+                    "UPDATE runtime.download_jobs SET state='closed',updated_at=now() WHERE session_id=%s",
+                    (session_uuid,),
+                )
+                database.execute(
+                    """
+                    UPDATE runtime.transcode_jobs
+                    SET state='closed',finished_at=COALESCE(finished_at,now()),
+                        updated_at=now()
+                    WHERE session_id=%s
+                    """,
+                    (session_uuid,),
+                )
                 database.commit()
+            if isinstance(exc, PlaybackCapacityError):
+                raise
             raise RuntimeError("nao foi possivel iniciar os workers") from exc
         return {"id": session_id, "token": token, "status_url": f"/api/playback/{session_id}?token={token}"}
 
@@ -1090,6 +1138,8 @@ def create_app() -> Flask:
             )
         except (TypeError, ValueError, UnsafeMediaError) as exc:
             return jsonify({"error": str(exc)}), 422
+        except PlaybackCapacityError as exc:
+            return jsonify({"error": str(exc), "retryable": True}), 429
         except RuntimeError as exc:
             return jsonify({"error": str(exc)}), 502
         return jsonify(result), 201

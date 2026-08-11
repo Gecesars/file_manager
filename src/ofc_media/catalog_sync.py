@@ -180,60 +180,78 @@ def _relative_metainfo(local_path: str, host_root: str) -> str:
     return safe_relative_path(value)
 
 
-def _canonical_file_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Normalize torrent files and assign a repeatable zero-based index.
+def _prepared_file_row(item: dict[str, Any]) -> dict[str, Any]:
+    infohash = str(item.get("infohash") or "").strip().casefold()
+    path = safe_relative_path(str(item.get("path") or ""))
+    size = int(item.get("size") or 0)
+    if size < 0:
+        raise ValueError(f"tamanho de arquivo negativo: {infohash}:{path}")
+    classification = classify_file(path, item.get("mime_type"))
+    raw_sha256 = item.get("sha256")
+    return {
+        "infohash": infohash,
+        "path": path,
+        "size": size,
+        "extension": classification.extension,
+        "file_kind": classification.file_kind,
+        "mime_type": classification.mime_type,
+        "is_video": classification.file_kind == "video",
+        "is_subtitle": classification.is_subtitle,
+        "sha256": normalize_sha256(str(raw_sha256)) if raw_sha256 else None,
+    }
 
-    The source schemas do not persist the original bencode file ordinal. A
-    path-based order is therefore used as a stable catalog identity; workers
-    still validate and recover the actual bencode/libtorrent index before any
-    materialization.
-    """
 
-    prepared: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-    for item in rows:
-        infohash = str(item.get("infohash") or "").strip().casefold()
-        path = safe_relative_path(str(item.get("path") or ""))
-        key = (infohash, path)
-        if key in seen:
-            raise ValueError(f"arquivo de torrent duplicado: {infohash}:{path}")
-        seen.add(key)
-        size = int(item.get("size") or 0)
-        if size < 0:
-            raise ValueError(f"tamanho de arquivo negativo: {infohash}:{path}")
-        classification = classify_file(path, item.get("mime_type"))
-        raw_sha256 = item.get("sha256")
-        sha256 = normalize_sha256(str(raw_sha256)) if raw_sha256 else None
-        prepared.append(
-            {
-                "infohash": infohash,
-                "path": path,
-                "size": size,
-                "extension": classification.extension,
-                "file_kind": classification.file_kind,
-                "mime_type": classification.mime_type,
-                "is_video": classification.file_kind == "video",
-                "is_subtitle": classification.is_subtitle,
-                "sha256": sha256,
-            }
-        )
-
+def _index_prepared_file_rows(
+    prepared: list[dict[str, Any]],
+) -> Iterator[dict[str, Any]]:
     prepared.sort(
-        key=lambda item: (
-            item["infohash"],
-            item["path"].casefold(),
-            item["path"],
-        )
+        key=lambda item: (item["infohash"], item["path"].casefold(), item["path"])
     )
     current_infohash: str | None = None
     file_index = 0
+    previous_key: tuple[str, str] | None = None
     for item in prepared:
+        key = (item["infohash"], item["path"])
+        if key == previous_key:
+            raise ValueError(f"arquivo de torrent duplicado: {key[0]}:{key[1]}")
+        previous_key = key
         if item["infohash"] != current_infohash:
             current_infohash = item["infohash"]
             file_index = 0
         item["file_index"] = file_index
         file_index += 1
-    return prepared
+        yield item
+
+
+def _canonical_file_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize arbitrary file rows and return the historical sorted list API."""
+
+    return list(_index_prepared_file_rows([_prepared_file_row(item) for item in rows]))
+
+
+def _canonical_file_stream(rows: Iterable[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+    """Normalize a cursor grouped by infohash while buffering one torrent only.
+
+    File paths are sorted in Python per torrent, preserving the exact historical
+    ``casefold`` order even when SQLite and Python disagree for Unicode text.
+    """
+
+    current_infohash: str | None = None
+    prepared: list[dict[str, Any]] = []
+    for raw in rows:
+        item = _prepared_file_row(raw)
+        infohash = str(item["infohash"])
+        if current_infohash is None:
+            current_infohash = infohash
+        elif infohash != current_infohash:
+            if infohash < current_infohash:
+                raise ValueError("arquivos de torrent fora da ordem por infohash")
+            yield from _index_prepared_file_rows(prepared)
+            prepared = []
+            current_infohash = infohash
+        prepared.append(item)
+    if prepared:
+        yield from _index_prepared_file_rows(prepared)
 
 
 class CatalogSynchronizer:
@@ -352,71 +370,85 @@ class CatalogSynchronizer:
         run_id = self._start_run("filecr", stat)
         source = self._open(path)
         try:
-            torrents = [
-                _row(row)
-                for row in source.execute(
-                    """
-                    SELECT t.*,p.name,p.primary_category,p.application_category
-                    FROM filecr_torrents t LEFT JOIN products p ON p.source_url=t.source_url
-                    """
-                )
-            ]
-            files = [
-                _row(row)
-                for row in source.execute(
-                    """
-                    SELECT infohash,path,size,NULL AS sha256
-                    FROM filecr_torrent_files
-                    ORDER BY infohash,path COLLATE BINARY
-                    """
-                )
-            ]
+            torrent_rows = source.execute(
+                """
+                SELECT t.*,p.name,p.primary_category,p.application_category
+                FROM filecr_torrents t LEFT JOIN products p ON p.source_url=t.source_url
+                """
+            )
+            torrent_count = self._upsert_torrents(
+                "filecr", (_row(row) for row in torrent_rows)
+            )
+            file_rows = source.execute(
+                """
+                SELECT infohash,path,size,NULL AS sha256
+                FROM filecr_torrent_files
+                ORDER BY lower(trim(infohash)) COLLATE BINARY,path COLLATE BINARY
+                """
+            )
+            file_count = self._upsert_files(
+                "filecr",
+                (_row(row) for row in file_rows),
+                ordered_by_infohash=True,
+            )
         finally:
             source.close()
-        self._upsert_torrents("filecr", torrents)
-        self._upsert_files("filecr", files)
-        return self._finish_run(run_id, "filecr", stat, {"torrents": len(torrents), "files": len(files)})
+        return self._finish_run(
+            run_id,
+            "filecr",
+            stat,
+            {"torrents": torrent_count, "files": file_count},
+        )
 
     def _sync_1337x(self, path: Path, stat: os.stat_result) -> dict[str, int]:
         run_id = self._start_run("1337x", stat)
         source = self._open(path)
         try:
-            torrents = [
-                _row(row)
-                for row in source.execute(
-                    """
-                    SELECT t.*,c.title,c.category,c.uploader,c.download_url,
-                           c.seeders,c.leechers,c.peer_count
-                    FROM torrents t LEFT JOIN candidates c ON c.detail_url=t.detail_url
-                    """
-                )
-            ]
-            files = [
-                _row(row)
-                for row in source.execute(
-                    """
-                    SELECT infohash,path,size,NULL AS sha256
-                    FROM torrent_files
-                    ORDER BY infohash,path COLLATE BINARY
-                    """
-                )
-            ]
+            torrent_rows = source.execute(
+                """
+                SELECT t.*,c.title,c.category,c.uploader,c.download_url,
+                       c.seeders,c.leechers,c.peer_count
+                FROM torrents t LEFT JOIN candidates c ON c.detail_url=t.detail_url
+                """
+            )
+            torrent_count = self._upsert_torrents(
+                "1337x", (_row(row) for row in torrent_rows)
+            )
+            file_rows = source.execute(
+                """
+                SELECT infohash,path,size,NULL AS sha256
+                FROM torrent_files
+                ORDER BY lower(trim(infohash)) COLLATE BINARY,path COLLATE BINARY
+                """
+            )
+            file_count = self._upsert_files(
+                "1337x",
+                (_row(row) for row in file_rows),
+                ordered_by_infohash=True,
+            )
         finally:
             source.close()
-        self._upsert_torrents("1337x", torrents)
-        self._upsert_files("1337x", files)
         self._sample_swarm()
-        return self._finish_run(run_id, "1337x", stat, {"torrents": len(torrents), "files": len(files)})
+        return self._finish_run(
+            run_id,
+            "1337x",
+            stat,
+            {"torrents": torrent_count, "files": file_count},
+        )
 
-    def _upsert_torrents(self, site: str, rows: list[dict[str, Any]]) -> None:
+    def _upsert_torrents(self, site: str, rows: Iterable[dict[str, Any]]) -> int:
         host_root = (
             self.settings.filecr_host_torrent_root
             if site == "filecr"
             else self.settings.x1337_host_torrent_root
         )
 
+        count = 0
+
         def values() -> Iterator[tuple[Any, ...]]:
+            nonlocal count
             for item in rows:
+                count += 1
                 source_url = str(item.get("source_url") or item.get("detail_url") or "")
                 title = str(item.get("title") or item.get("name") or item.get("display_name") or "")
                 category = str(
@@ -469,9 +501,20 @@ class CatalogSynchronizer:
         with connection(self.settings) as database:
             _execute_batches(database, sql, _batches(values()))
             database.commit()
+        return count
 
-    def _upsert_files(self, site: str, rows: list[dict[str, Any]]) -> None:
-        canonical_rows = _canonical_file_rows(rows)
+    def _upsert_files(
+        self,
+        site: str,
+        rows: Iterable[dict[str, Any]],
+        *,
+        ordered_by_infohash: bool = False,
+    ) -> int:
+        canonical_rows: Iterable[dict[str, Any]] = (
+            _canonical_file_stream(rows)
+            if ordered_by_infohash
+            else _canonical_file_rows(rows)
+        )
         with connection(self.settings) as database:
             mapping = {
                 str(row["infohash"]): int(row["id"])
@@ -481,8 +524,12 @@ class CatalogSynchronizer:
                 )
             }
 
+            count = 0
+
             def values() -> Iterator[tuple[Any, ...]]:
+                nonlocal count
                 for item in canonical_rows:
+                    count += 1
                     torrent_id = mapping.get(item["infohash"])
                     if torrent_id is None:
                         continue
@@ -514,6 +561,7 @@ class CatalogSynchronizer:
             """
             _execute_batches(database, sql, _batches(values()))
             database.commit()
+        return count
 
     def _sample_swarm(self) -> None:
         with connection(self.settings) as database:
@@ -528,11 +576,6 @@ class CatalogSynchronizer:
 
     def _sync_metadata(self, path: Path, stat: os.stat_result) -> dict[str, int]:
         run_id = self._start_run("metadata", stat)
-        source = self._open(path)
-        try:
-            rows = [_row(row) for row in source.execute("SELECT * FROM catalog_metadata")]
-        finally:
-            source.close()
         columns = (
             "site", "infohash", "source_title", "category", "media_kind", "query_title",
             "query_year", "query_type", "query_imdb_id", "source", "status", "imdb_id",
@@ -557,22 +600,27 @@ class CatalogSynchronizer:
               retry_after=excluded.retry_after,error=excluded.error,
               source_record=excluded.source_record,updated_at=now()
         """
-        with connection(self.settings) as database:
-            _execute_batches(
-                database,
-                sql,
-                _batches(tuple(item.get(name) for name in columns) + (Jsonb(item),) for item in rows),
-            )
-            database.commit()
-        return self._finish_run(run_id, "metadata", stat, {"metadata": len(rows)})
+        count = 0
+        source = self._open(path)
+        try:
+            rows = source.execute("SELECT * FROM catalog_metadata")
+
+            def metadata_values() -> Iterator[tuple[Any, ...]]:
+                nonlocal count
+                for row in rows:
+                    item = _row(row)
+                    count += 1
+                    yield tuple(item.get(name) for name in columns) + (Jsonb(item),)
+
+            with connection(self.settings) as database:
+                _execute_batches(database, sql, _batches(metadata_values()))
+                database.commit()
+        finally:
+            source.close()
+        return self._finish_run(run_id, "metadata", stat, {"metadata": count})
 
     def _sync_subtitles(self, path: Path, stat: os.stat_result) -> dict[str, int]:
         run_id = self._start_run("subtitles", stat)
-        source = self._open(path)
-        try:
-            rows = [_row(row) for row in source.execute("SELECT * FROM subtitle_jobs")]
-        finally:
-            source.close()
         columns = (
             "site", "infohash", "torrent_path", "language", "file_name", "normalized_name",
             "extension", "size", "season", "episode", "media_path", "match_method",
@@ -596,22 +644,28 @@ class CatalogSynchronizer:
               source_updated_at=excluded.source_updated_at,
               source_record=excluded.source_record,updated_at=now()
         """
-        with connection(self.settings) as database:
+        count = 0
+        source = self._open(path)
+        try:
+            rows = source.execute("SELECT * FROM subtitle_jobs")
+
             def subtitle_values() -> Iterator[tuple[Any, ...]]:
-                for item in rows:
+                nonlocal count
+                for row in rows:
+                    item = _row(row)
+                    count += 1
                     values = tuple(
                         bool(item.get(name)) if name == "active" else item.get(name)
                         for name in columns
                     )
                     yield values + (Jsonb(item),)
 
-            _execute_batches(
-                database,
-                sql,
-                _batches(subtitle_values()),
-            )
-            database.commit()
-        return self._finish_run(run_id, "subtitles", stat, {"subtitles": len(rows)})
+            with connection(self.settings) as database:
+                _execute_batches(database, sql, _batches(subtitle_values()))
+                database.commit()
+        finally:
+            source.close()
+        return self._finish_run(run_id, "subtitles", stat, {"subtitles": count})
 
 
 def main() -> None:

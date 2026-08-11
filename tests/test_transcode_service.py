@@ -10,7 +10,11 @@ import pytest
 
 from ofc_media import transcode_service
 from ofc_media.media import MediaPlan, Rendition
-from ofc_media.transcode_service import TranscodeManager
+from ofc_media.transcode_service import (
+    TranscodeCapacityError,
+    TranscodeManager,
+    read_text_tail,
+)
 
 
 SESSION_ID = "b" * 32
@@ -23,6 +27,8 @@ def manager_settings(tmp_path: Path) -> SimpleNamespace:
         hls_root=tmp_path / "hls",
         transcode_encoder="auto",
         max_transcodes=1,
+        max_transcode_queue=1,
+        ffmpeg_log_tail_bytes=4096,
         drive_source_url="http://drive:7103",
         torrent_engine_url="http://torrent:7101",
         internal_token="I" * 32,
@@ -246,3 +252,145 @@ def test_loopback_address_validation_accepts_only_local_interfaces():
     assert transcode_service.is_loopback_remote("::ffff:127.0.0.1")
     assert not transcode_service.is_loopback_remote("10.0.0.1")
     assert not transcode_service.is_loopback_remote(None)
+
+
+def test_transcode_admission_bounds_waiting_threads_and_returns_429(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    settings = manager_settings(tmp_path)
+    manager = TranscodeManager(settings)
+    created: list[object] = []
+
+    class ParkedThread:
+        def __init__(self, **_kwargs: object) -> None:
+            self.started = False
+            created.append(self)
+
+        def start(self) -> None:
+            self.started = True
+
+        def is_alive(self) -> bool:
+            return self.started
+
+    monkeypatch.setattr(transcode_service.threading, "Thread", ParkedThread)
+    manager.start("a" * 32, CAPABILITY)
+    manager.start("b" * 32, CAPABILITY)
+
+    with pytest.raises(TranscodeCapacityError, match="capacidade"):
+        manager.start("c" * 32, CAPABILITY)
+
+    assert len(created) == 2
+    monkeypatch.setattr(
+        transcode_service.Settings,
+        "from_env",
+        classmethod(lambda cls: settings),
+    )
+    monkeypatch.setattr(transcode_service, "TranscodeManager", lambda _settings: manager)
+    monkeypatch.setattr(transcode_service, "start_heartbeat", lambda *_args: None)
+    client = transcode_service.create_app().test_client()
+    response = client.post(
+        "/internal/transcodes",
+        json={"session_id": "c" * 32, "token": CAPABILITY},
+        headers={"Authorization": f"Bearer {settings.internal_token}"},
+    )
+    assert response.status_code == 429
+    assert response.get_json()["retryable"] is True
+
+
+def test_active_cache_key_is_released_only_by_its_owner(tmp_path: Path):
+    manager = TranscodeManager(manager_settings(tmp_path))
+
+    assert manager._claim_cache_key("cache", "owner") is True
+    assert manager._claim_cache_key("cache", "waiter") is False
+    manager._release_cache_key("cache", "waiter")
+    assert manager.active_keys == {"cache": "owner"}
+    manager._release_cache_key("cache", "owner")
+    assert manager.active_keys == {}
+
+
+def test_ffmpeg_log_reader_reads_only_bounded_tail(tmp_path: Path):
+    log_path = tmp_path / "ffmpeg.log"
+    log_path.write_bytes(b"prefix-secret\n" + b"x" * 10_000 + b"tail-marker")
+
+    tail = read_text_tail(log_path, 64)
+
+    assert len(tail.encode()) <= 64
+    assert tail.endswith("tail-marker")
+    assert "prefix-secret" not in tail
+
+
+def test_transcode_slot_reaps_stubborn_process_before_releasing_capacity(
+    tmp_path: Path,
+):
+    manager = TranscodeManager(manager_settings(tmp_path))
+    events: list[str] = []
+
+    class TrackingSlots:
+        def acquire(self) -> None:
+            events.append("acquire")
+
+        def release(self) -> None:
+            events.append("release")
+
+    class StubbornProcess:
+        def poll(self) -> None:
+            events.append("poll")
+            return None
+
+        def terminate(self) -> None:
+            events.append("terminate")
+
+        def wait(self, timeout: float | None = None) -> int:
+            events.append(f"wait:{timeout}")
+            if timeout is not None:
+                raise transcode_service.subprocess.TimeoutExpired("ffmpeg", timeout)
+            return -9
+
+        def kill(self) -> None:
+            events.append("kill")
+
+    manager.slots = TrackingSlots()  # type: ignore[assignment]
+    process = StubbornProcess()
+
+    with pytest.raises(RuntimeError, match="falha simulada"):
+        with manager._transcode_slot(lambda: process):  # type: ignore[arg-type]
+            events.append("body")
+            raise RuntimeError("falha simulada")
+
+    assert events == [
+        "acquire",
+        "body",
+        "poll",
+        "terminate",
+        "wait:5.0",
+        "kill",
+        "wait:None",
+        "release",
+    ]
+
+
+def test_details_probes_capabilities_outside_manager_lock(tmp_path: Path):
+    manager = TranscodeManager(manager_settings(tmp_path))
+
+    class TrackingLock:
+        held = False
+
+        def __enter__(self) -> None:
+            assert self.held is False
+            self.held = True
+
+        def __exit__(self, *_args: object) -> None:
+            self.held = False
+
+    class CapabilityProbe:
+        def capabilities(self) -> dict[str, str]:
+            assert lock.held is False
+            return {"selected_encoder": "copy"}
+
+    lock = TrackingLock()
+    manager.lock = lock  # type: ignore[assignment]
+    manager.media = CapabilityProbe()  # type: ignore[assignment]
+
+    details = manager.details()
+
+    assert details["capabilities"] == {"selected_encoder": "copy"}
