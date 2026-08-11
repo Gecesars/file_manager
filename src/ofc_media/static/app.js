@@ -23,6 +23,8 @@ const state = {
   notice: "",
   pendingTransfers: new Set(),
   filesItems: [],
+  fileTorrents: new Map(),
+  selectedTorrents: new Map(),
   selectedFiles: new Map(),
   selectedSource: "",
 };
@@ -109,7 +111,7 @@ function kindLabel(kind) {
   return ({
     video: "Vídeo", audio: "Áudio", subtitle: "Legenda", image: "Imagem",
     document: "Documento", archive: "Compactado", software: "Software",
-    dataset: "Dataset", other: "Outro",
+    dataset: "Dataset", other: "Outro", mixed: "Múltiplos tipos",
   })[kind] || "Outro";
 }
 
@@ -141,6 +143,7 @@ function statusLabel(value) {
     queued: "Na fila", downloading: "Baixando", uploading: "Enviando",
     verifying: "Verificando", completed: "Concluído", failed: "Falhou",
     unavailable: "Indisponível", empty: "Sem itens", online: "Online",
+    partial: "Disponibilidade parcial", mixed: "Status misto",
   })[normalized] || String(value || "Catalogado");
 }
 
@@ -454,12 +457,12 @@ function updateFilesContext() {
   const site = $("[data-files-site]").value;
   const presence = $("[data-presence]").value;
   const contexts = {
-    gdrive: ["Arquivos do Google Drive", "Conteúdo remoto catalogado e disponível para streaming ou download local."],
-    torrent: ["Inventário de torrents", "Arquivos descritos nos metadados FileCR e 1337x, ainda sem exigir download."],
-    local: ["Arquivos locais", "Downloads concluídos e validados na área de armazenamento local."],
-    filecr: ["Inventário FileCR", "Arquivos descobertos pelo coletor FileCR."],
-    "1337x": ["Inventário 1337x", "Arquivos descobertos pelo coletor 1337x."],
-    all: ["Todos os arquivos", "Drive, área local e inventário torrent em uma única busca."],
+    gdrive: ["Torrents no Google Drive", "Acervo remoto organizado por torrent; expanda um card para ver seus arquivos."],
+    torrent: ["Inventário de torrents", "FileCR e 1337x organizados por torrent, sem exigir download para explorar."],
+    local: ["Torrents disponíveis localmente", "Downloads concluídos e validados, reunidos por torrent de origem."],
+    filecr: ["Torrents do FileCR", "Pacotes do inventário FileCR com arquivos aninhados sob cada torrent."],
+    "1337x": ["Torrents do 1337x", "Conteúdos do inventário 1337x com arquivos aninhados sob cada torrent."],
+    all: ["Torrents de todas as fontes", "Drive, área local, FileCR e 1337x em uma navegação organizada por torrent."],
   };
   const selected = site === "gdrive"
     ? contexts.gdrive
@@ -592,42 +595,115 @@ function syncTypeControls() {
   });
 }
 
+function torrentSelectionKey(item) {
+  return `${item.site || item.source_site || "unknown"}:${item.infohash || item.torrent_id || item.id || "unknown"}`;
+}
+
+function torrentTitle(item) {
+  return item.title || item.canonical_title || item.display_name || item.torrent_title || item.infohash || "Torrent sem título";
+}
+
+function countEntries(counts) {
+  if (!counts || typeof counts !== "object") return [];
+  return Object.entries(counts).map(([key, value]) => ({
+    key,
+    count: Number(typeof value === "object" ? value.count ?? value.files ?? value.total : value) || 0,
+    bytes: typeof value === "object" ? value.bytes ?? value.size : null,
+  })).filter((entry) => entry.count > 0);
+}
+
+function torrentFileCount(item) {
+  return Number(item.file_count ?? item.files ?? item.file_total ?? 0) || 0;
+}
+
+function torrentByteCount(item) {
+  return Number(item.bytes ?? item.size ?? item.total_size ?? 0) || 0;
+}
+
+function torrentSource(item) {
+  return item.source || item.site || "";
+}
+
+function torrentLocationSummary(item) {
+  const entries = countEntries(item.location_counts);
+  if (entries.length) {
+    return entries.map((entry) => `${groupLabel(entry.key, "location")} ${formatNumber(entry.count)}`).join(" · ");
+  }
+  return groupLabel(item.location_group || item.location_kind || "torrent", "location");
+}
+
+function torrentStatusSummary(item) {
+  const entries = countEntries(item.status_counts);
+  if (entries.length === 1) return statusLabel(entries[0].key);
+  if (entries.length > 1) return `${formatNumber(entries.length)} status`;
+  return statusLabel(item.status || "cataloged");
+}
+
+function torrentMayTransfer(group, target) {
+  const summary = group.summary;
+  const total = torrentFileCount(summary);
+  const locations = new Map(countEntries(summary.location_counts).map((entry) => [entry.key, entry.count]));
+  if (target === "gdrive") {
+    if (summary.site === "gdrive") return false;
+    const onDrive = Number(locations.get("gdrive") || 0) + Number(locations.get("drive") || 0) + Number(locations.get("both") || 0);
+    return total === 0 || onDrive < total;
+  }
+  if (torrentSource(summary) === "local") return false;
+  const local = Number(locations.get("local") || 0) + Number(locations.get("both") || 0);
+  return total === 0 || local < total;
+}
+
+function refreshLoadedFiles() {
+  state.filesItems = Array.from(state.fileTorrents.values()).flatMap((group) => group.files || []);
+}
+
 function updateSelectionUI() {
-  const selected = Array.from(state.selectedFiles.values());
-  const localCount = selected.filter((item) => canTransfer(item, "local")).length;
-  const driveCount = selected.filter((item) => canTransfer(item, "gdrive")).length;
+  const selectedFiles = Array.from(state.selectedFiles.values());
+  const selectedTorrents = Array.from(state.selectedTorrents.values());
+  const estimatedFiles = selectedFiles.length + selectedTorrents.reduce((total, group) => total + torrentFileCount(group.summary), 0);
+  const localCount = selectedFiles.filter((item) => canTransfer(item, "local")).length;
+  const driveCount = selectedFiles.filter((item) => canTransfer(item, "gdrive")).length;
+  const hasLocalTorrent = selectedTorrents.some((group) => torrentMayTransfer(group, "local"));
+  const hasDriveTorrent = selectedTorrents.some((group) => torrentMayTransfer(group, "gdrive"));
+  const hasTorrentSelection = selectedTorrents.length > 0;
   const bar = $("[data-bulk-bar]");
-  bar.hidden = selected.length === 0;
-  $("[data-selected-count]").textContent = `${formatNumber(selected.length)} arquivo(s) selecionado(s)`;
-  $("[data-bulk-local]").disabled = localCount === 0;
-  $("[data-bulk-local]").textContent = `Manter no Local (${formatNumber(localCount)})`;
-  $("[data-bulk-drive]").disabled = driveCount === 0;
-  $("[data-bulk-drive]").textContent = `Disponibilizar no Drive (${formatNumber(driveCount)})`;
-  $$('[data-file-select]').forEach((control) => {
-    const checked = state.selectedFiles.has(control.dataset.fileSelect);
-    control.checked = checked;
-    control.closest("tr")?.classList.toggle("selected", checked);
+  bar.hidden = !hasTorrentSelection && selectedFiles.length === 0;
+  $("[data-selected-count]").textContent = `${formatNumber(selectedTorrents.length)} torrent(s) · cerca de ${formatNumber(estimatedFiles)} arquivo(s)`;
+  $("[data-bulk-local]").disabled = !hasLocalTorrent && localCount === 0;
+  $("[data-bulk-local]").textContent = `Manter no Local (${formatNumber(estimatedFiles)})`;
+  $("[data-bulk-drive]").disabled = !hasDriveTorrent && driveCount === 0;
+  $("[data-bulk-drive]").textContent = `Disponibilizar no Drive (${formatNumber(estimatedFiles)})`;
+
+  $$('[data-torrent-select]').forEach((control) => {
+    const selected = state.selectedTorrents.has(control.dataset.torrentSelect);
+    control.checked = selected;
+    control.indeterminate = false;
+    control.closest(".torrent-card")?.classList.toggle("selected", selected);
   });
-  const selectable = state.filesItems.filter((item) => canTransfer(item, "local") || canTransfer(item, "gdrive"));
-  const selectedVisible = selectable.filter((item) => state.selectedFiles.has(fileKey(item))).length;
+  $$('[data-file-select]').forEach((control) => {
+    const group = state.fileTorrents.get(control.dataset.torrentKey);
+    const wholeTorrent = group && state.selectedTorrents.has(group.key);
+    const checked = wholeTorrent || state.selectedFiles.has(control.dataset.fileSelect);
+    control.checked = checked;
+    control.closest(".torrent-file-item")?.classList.toggle("selected", checked);
+  });
+
+  const groups = Array.from(state.fileTorrents.values());
   const selectVisible = $("[data-select-visible]");
-  selectVisible.disabled = selectable.length === 0;
-  selectVisible.checked = selectable.length > 0 && selectedVisible === selectable.length;
-  selectVisible.indeterminate = selectedVisible > 0 && selectedVisible < selectable.length;
+  const selectedVisible = groups.filter((group) => state.selectedTorrents.has(group.key)).length;
+  selectVisible.disabled = groups.length === 0;
+  selectVisible.checked = groups.length > 0 && selectedVisible === groups.length;
+  selectVisible.indeterminate = selectedVisible > 0 && selectedVisible < groups.length;
+  const loadedGroups = groups.filter((group) => group.loaded).length;
+  $("[data-loaded-files-count]").textContent = state.filesItems.length
+    ? `${formatNumber(state.filesItems.length)} arquivo(s) carregado(s) em ${formatNumber(loadedGroups)} torrent(s). A seleção do card sempre abrange o torrent filtrado inteiro.`
+    : "Expanda um torrent para carregar seus arquivos; selecionar o card abrange o torrent filtrado inteiro.";
 }
 
 function clearFileSelection() {
+  state.selectedTorrents.clear();
   state.selectedFiles.clear();
   updateSelectionUI();
-}
-
-function groupValue(item, groupBy) {
-  if (groupBy === "type") return kindOf(item);
-  if (groupBy === "source") return sourceOf(item);
-  if (groupBy === "status") return item.status || "cataloged";
-  if (groupBy === "presence") return item.presence || presenceLabel(item)[0];
-  if (groupBy === "location") return item.location_group || item.location_kind || item.location || locationText(item);
-  return "";
 }
 
 function groupLabel(value, groupBy) {
@@ -641,7 +717,7 @@ function groupLabel(value, groupBy) {
   })[value] || value;
   if (groupBy === "location") return ({
     torrent: "Somente inventário torrent", local: "Local", gdrive: "Google Drive",
-    both: "Local e Google Drive",
+    both: "Local e Google Drive", mixed: "Múltiplas localizações",
   })[value] || value;
   return value || "Sem localização";
 }
@@ -657,13 +733,15 @@ function normalizedGroups(groups) {
   if (Array.isArray(groups)) return groups.map((entry) => ({
     value: entry.value || entry.key || entry.type || entry.source || entry.status || entry.presence || entry.location,
     label: entry.label,
-    count: entry.count ?? entry.files ?? entry.total,
+    count: entry.torrents ?? entry.count ?? entry.total,
+    files: entry.files ?? entry.file_count,
     bytes: entry.bytes ?? entry.size,
   })).filter((entry) => entry.value);
   if (groups && typeof groups === "object") return Object.entries(groups).map(([value, entry]) => ({
     value,
     label: typeof entry === "object" ? entry.label : null,
-    count: typeof entry === "object" ? entry.count ?? entry.files ?? entry.total : entry,
+    count: typeof entry === "object" ? entry.torrents ?? entry.count ?? entry.total : entry,
+    files: typeof entry === "object" ? entry.files ?? entry.file_count : null,
     bytes: typeof entry === "object" ? entry.bytes ?? entry.size : null,
   }));
   return [];
@@ -674,28 +752,370 @@ function renderFileGroups(groups, groupBy) {
   target.replaceChildren();
   normalizedGroups(groups).forEach((group) => {
     const displayLabel = displayGroupLabel(group, groupBy);
-    const card = document.createElement("button");
-    card.type = "button";
+    const card = document.createElement("article");
     card.className = "file-group";
-    card.setAttribute("aria-label", `Selecionar itens visíveis do grupo ${displayLabel}`);
     const label = document.createElement("strong");
     label.textContent = displayLabel;
     const count = document.createElement("span");
-    count.textContent = `${formatNumber(group.count)} arquivo(s)${group.bytes == null ? "" : ` · ${bytes(group.bytes)}`}`;
+    count.textContent = `${formatNumber(group.count)} torrent(s)${group.files == null ? "" : ` · ${formatNumber(group.files)} arquivo(s)`}`;
     const hint = document.createElement("small");
-    hint.textContent = "Selecionar visíveis";
+    hint.textContent = group.bytes == null ? "Resumo do acervo filtrado" : bytes(group.bytes);
     card.append(label, count, hint);
-    card.onclick = () => {
-      const matches = state.filesItems.filter((item) => String(groupValue(item, groupBy)).toLowerCase() === String(group.value).toLowerCase());
-      matches.forEach((item) => {
-        if (canTransfer(item, "local") || canTransfer(item, "gdrive")) state.selectedFiles.set(fileKey(item), item);
-      });
-      updateSelectionUI();
-      if (!matches.length) toast("Nenhum item visível pertence a este grupo.");
-    };
     target.append(card);
   });
   target.hidden = target.childElementCount === 0;
+}
+
+function torrentFilters() {
+  return {
+    q: $("[data-files-query]").value,
+    kind: $("[data-kind]").value,
+    status: $("[data-files-status]").value,
+    presence: $("[data-presence]").value,
+  };
+}
+
+function torrentFileParams(group, page) {
+  const summary = group.summary;
+  const params = new URLSearchParams({
+    view: "files",
+    infohash: summary.infohash,
+    q: group.filters.q,
+    type: group.filters.kind,
+    kind: group.filters.kind,
+    status: group.filters.status,
+    presence: group.filters.presence,
+    page: String(page),
+    per_page: "200",
+  });
+  if (torrentSource(summary) === "local") {
+    params.set("source", "local");
+    params.set("origin_site", summary.site);
+  } else {
+    params.set("source", summary.site);
+  }
+  return params;
+}
+
+async function fetchTorrentFilePage(group, page) {
+  return api(`/api/files?${torrentFileParams(group, page)}`);
+}
+
+function torrentMetric(label, value) {
+  const metric = document.createElement("div");
+  const name = document.createElement("span");
+  name.textContent = label;
+  const content = document.createElement("strong");
+  content.textContent = value;
+  metric.append(name, content);
+  return metric;
+}
+
+function renderSummaryPills(target, entries, labeler, className = "kind-badge") {
+  entries.forEach((entry) => {
+    const badge = document.createElement("span");
+    badge.className = className;
+    badge.textContent = `${labeler(entry.key)} ${formatNumber(entry.count)}`;
+    target.append(badge);
+  });
+}
+
+function rawFileStatus(item) {
+  if (item.presence_confidence === "possible" && item.status !== "available") return "possible";
+  return item.status || (hasLocation(item, "local") || hasLocation(item, "gdrive") ? "available" : "cataloged");
+}
+
+function renderTorrentFile(group, item) {
+  const row = document.createElement("article");
+  row.className = "torrent-file-item";
+  const choice = document.createElement("label");
+  choice.className = "torrent-file-choice";
+  const select = document.createElement("input");
+  select.type = "checkbox";
+  select.dataset.fileSelect = fileKey(item);
+  select.dataset.torrentKey = group.key;
+  select.setAttribute("aria-label", `Selecionar somente ${item.path || item.display_name || "arquivo"}`);
+  select.disabled = !canTransfer(item, "local") && !canTransfer(item, "gdrive");
+  select.onchange = () => {
+    if (state.selectedTorrents.has(group.key)) {
+      state.selectedTorrents.delete(group.key);
+      group.files.forEach((loadedItem) => {
+        if (fileKey(loadedItem) !== fileKey(item) && (canTransfer(loadedItem, "local") || canTransfer(loadedItem, "gdrive"))) {
+          state.selectedFiles.set(fileKey(loadedItem), loadedItem);
+        }
+      });
+    }
+    if (select.checked) state.selectedFiles.set(fileKey(item), item);
+    else state.selectedFiles.delete(fileKey(item));
+    updateSelectionUI();
+  };
+  choice.append(select);
+
+  const main = document.createElement("div");
+  main.className = "torrent-file-main";
+  const name = document.createElement("strong");
+  name.textContent = item.path?.split(/[\\/]/).at(-1) || item.display_name || item.path || "Arquivo sem nome";
+  const path = document.createElement("small");
+  path.textContent = item.path || "Caminho não informado";
+  main.append(name, path);
+
+  const facts = document.createElement("div");
+  facts.className = "torrent-file-facts";
+  const kind = document.createElement("span");
+  kind.className = "kind-badge";
+  kind.textContent = kindLabel(kindOf(item));
+  const status = document.createElement("span");
+  const rawStatus = rawFileStatus(item);
+  status.className = `status-badge ${statusClass(rawStatus)}`;
+  status.textContent = statusLabel(rawStatus);
+  const source = document.createElement("span");
+  source.className = `source-badge ${sourceOf(item)}`;
+  source.textContent = sourceLabel(sourceOf(item));
+  facts.append(kind, status, source);
+
+  const location = document.createElement("div");
+  location.className = "torrent-file-location";
+  const locationLabel = document.createElement("span");
+  locationLabel.textContent = "Localização";
+  const locationValue = document.createElement("strong");
+  locationValue.textContent = locationText(item);
+  location.append(locationLabel, locationValue);
+  const size = document.createElement("strong");
+  size.className = "torrent-file-size";
+  size.textContent = bytes(item.size);
+  const actions = document.createElement("div");
+  actions.className = "row-actions torrent-file-actions";
+  if (canTransfer(item, "local")) actions.append(button("Manter local", "", () => createTransfer(item, "local")));
+  if (canTransfer(item, "gdrive")) actions.append(button("Enviar ao Drive", "", () => createTransfer(item, "gdrive")));
+  row.append(choice, main, facts, location, size, actions);
+  return row;
+}
+
+function renderTorrentDetails(group) {
+  const target = group.elements.details;
+  target.replaceChildren();
+  const scope = document.createElement("p");
+  scope.className = "torrent-selection-scope";
+  const knownTotal = group.total || torrentFileCount(group.summary);
+  scope.textContent = `${formatNumber(group.files.length)} de ${formatNumber(knownTotal)} arquivo(s) carregado(s). Os checkboxes abaixo fazem seleção individual; o checkbox e as ações do card abrangem todos os arquivos filtrados do torrent.`;
+  const actions = document.createElement("div");
+  actions.className = "torrent-loaded-actions";
+  if (torrentMayTransfer(group, "local")) actions.append(button("Torrent inteiro → Local", "secondary", () => createTorrentTransfers([group], "local")));
+  if (torrentMayTransfer(group, "gdrive")) actions.append(button("Torrent inteiro → Drive", "primary", () => createTorrentTransfers([group], "gdrive")));
+  const files = document.createElement("div");
+  files.className = "torrent-files";
+  group.files.forEach((item) => files.append(renderTorrentFile(group, item)));
+  target.append(scope, actions, files);
+  if (group.page < group.pages) {
+    const more = button(`Carregar mais (${formatNumber(group.files.length)}/${formatNumber(knownTotal)})`, "secondary torrent-load-more", () => loadTorrentFiles(group, group.page + 1));
+    target.append(more);
+  }
+  updateSelectionUI();
+}
+
+async function loadTorrentFiles(group, page = 1) {
+  if (group.loading) return group.loading;
+  group.elements.toggle.setAttribute("aria-busy", "true");
+  group.elements.message.hidden = false;
+  group.elements.message.textContent = page === 1 ? "Carregando arquivos do torrent…" : "Carregando próxima página…";
+  group.loading = (async () => {
+    const data = await fetchTorrentFilePage(group, page);
+    const incoming = Array.isArray(data.items) ? data.items : [];
+    const merged = new Map((page === 1 ? [] : group.files).map((item) => [fileKey(item), item]));
+    incoming.forEach((item) => merged.set(fileKey(item), item));
+    group.files = Array.from(merged.values());
+    group.loaded = true;
+    group.page = Number(data.page || page);
+    group.total = Number(data.total ?? torrentFileCount(group.summary));
+    group.pages = Number(data.pages || Math.max(1, Math.ceil(group.total / 200)));
+    refreshLoadedFiles();
+    renderTorrentDetails(group);
+    group.elements.message.hidden = true;
+    return data;
+  })();
+  try {
+    return await group.loading;
+  } catch (error) {
+    group.elements.message.hidden = false;
+    group.elements.message.textContent = `Não foi possível carregar os arquivos: ${error.message}`;
+    throw error;
+  } finally {
+    group.loading = null;
+    group.elements.toggle.removeAttribute("aria-busy");
+  }
+}
+
+async function resolveTorrentFiles(group) {
+  const resolved = new Map();
+  let page = 1;
+  let pages = 1;
+  do {
+    const data = await fetchTorrentFilePage(group, page);
+    const items = Array.isArray(data.items) ? data.items : [];
+    items.forEach((item) => resolved.set(fileKey(item), item));
+    const total = Number(data.total ?? torrentFileCount(group.summary));
+    pages = Number(data.pages || Math.max(1, Math.ceil(total / 200)));
+    if (!items.length) break;
+    page += 1;
+  } while (page <= pages);
+  return Array.from(resolved.values());
+}
+
+async function resolveTransferSelection(groups, individualFiles) {
+  const resolved = new Map(individualFiles.map((item) => [fileKey(item), item]));
+  for (const group of groups) {
+    const items = await resolveTorrentFiles(group);
+    items.forEach((item) => resolved.set(fileKey(item), item));
+  }
+  return Array.from(resolved.values());
+}
+
+async function createTorrentTransfers(groups, target, individualFiles = []) {
+  if (groups.length) toast(`Resolvendo todos os arquivos filtrados de ${formatNumber(groups.length)} torrent(s)…`);
+  const items = await resolveTransferSelection(groups, individualFiles);
+  if (!items.length) {
+    toast("Nenhum arquivo filtrado foi encontrado para a transferência.", true);
+    return [];
+  }
+  return createTransfers(items, target);
+}
+
+async function createSelectedTransfers(target) {
+  const groups = Array.from(state.selectedTorrents.values());
+  const individualFiles = Array.from(state.selectedFiles.values());
+  const localButton = $("[data-bulk-local]");
+  const driveButton = $("[data-bulk-drive]");
+  localButton.disabled = true;
+  driveButton.disabled = true;
+  localButton.setAttribute("aria-busy", "true");
+  driveButton.setAttribute("aria-busy", "true");
+  try {
+    const results = await createTorrentTransfers(groups, target, individualFiles);
+    if (results.length) {
+      groups.forEach((group) => state.selectedTorrents.delete(group.key));
+      updateSelectionUI();
+      if (state.selectedTorrents.size === 0 && state.selectedFiles.size === 0) setView("transfers");
+    }
+    return results;
+  } finally {
+    localButton.removeAttribute("aria-busy");
+    driveButton.removeAttribute("aria-busy");
+    updateSelectionUI();
+  }
+}
+
+function renderTorrentCard(group) {
+  const item = group.summary;
+  const card = document.createElement("article");
+  card.className = "torrent-card";
+  const head = document.createElement("div");
+  head.className = "torrent-card-head";
+  const choice = document.createElement("label");
+  choice.className = "torrent-choice";
+  const select = document.createElement("input");
+  select.type = "checkbox";
+  select.dataset.torrentSelect = group.key;
+  select.setAttribute("aria-label", `Selecionar torrent completo ${torrentTitle(item)}`);
+  select.onchange = () => {
+    if (select.checked) {
+      state.selectedTorrents.set(group.key, group);
+      group.files.forEach((file) => state.selectedFiles.delete(fileKey(file)));
+    } else {
+      state.selectedTorrents.delete(group.key);
+    }
+    updateSelectionUI();
+  };
+  choice.append(select);
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "torrent-card-toggle";
+  toggle.setAttribute("aria-expanded", "false");
+  const arrow = document.createElement("span");
+  arrow.className = "torrent-arrow";
+  arrow.setAttribute("aria-hidden", "true");
+  arrow.textContent = "▶";
+  const identity = document.createElement("span");
+  identity.className = "torrent-identity";
+  const badges = document.createElement("span");
+  badges.className = "torrent-identity-badges";
+  const source = document.createElement("span");
+  source.className = `source-badge ${torrentSource(item)}`;
+  source.textContent = sourceLabel(torrentSource(item));
+  const category = document.createElement("span");
+  category.className = "torrent-category";
+  category.textContent = item.category || "Sem categoria";
+  badges.append(source, category);
+  const title = document.createElement("strong");
+  title.textContent = torrentTitle(item);
+  const hash = document.createElement("small");
+  hash.textContent = item.infohash ? `Hash ${item.infohash}` : "Hash não informado";
+  identity.append(badges, title, hash);
+  toggle.append(arrow, identity);
+  head.append(choice, toggle);
+
+  const summary = document.createElement("div");
+  summary.className = "torrent-summary-grid";
+  const matchedFiles = torrentFileCount(item);
+  const totalFiles = Number(item.total_files ?? matchedFiles);
+  const fileMetric = totalFiles !== matchedFiles
+    ? `${formatNumber(matchedFiles)} filtrados · ${formatNumber(totalFiles)} no total`
+    : formatNumber(matchedFiles);
+  const matchedBytes = torrentByteCount(item);
+  const totalBytes = Number(item.total_bytes ?? matchedBytes);
+  const volumeMetric = totalBytes !== matchedBytes
+    ? `${bytes(matchedBytes)} filtrados · ${bytes(totalBytes)} no total`
+    : bytes(matchedBytes);
+  summary.append(
+    torrentMetric("Arquivos", fileMetric),
+    torrentMetric("Volume", volumeMetric),
+    torrentMetric("Status", torrentStatusSummary(item)),
+    torrentMetric("Localização", torrentLocationSummary(item)),
+  );
+  const typeLine = document.createElement("div");
+  typeLine.className = "torrent-type-line";
+  renderSummaryPills(typeLine, countEntries(item.types), kindLabel);
+  if (!typeLine.childElementCount) {
+    const fallback = document.createElement("span");
+    fallback.className = "kind-badge";
+    fallback.textContent = "Tipos não informados";
+    typeLine.append(fallback);
+  }
+
+  const footer = document.createElement("div");
+  footer.className = "torrent-card-footer";
+  const scope = document.createElement("span");
+  scope.textContent = "Selecionar o card inclui todos os arquivos filtrados deste torrent.";
+  const cardActions = document.createElement("div");
+  cardActions.className = "torrent-card-actions";
+  const videoCount = Number(
+    typeof item.types?.video === "object" ? item.types.video.count ?? item.types.video.files : item.types?.video,
+  ) || 0;
+  if (item.site && item.infohash && videoCount > 0) {
+    cardActions.append(button("Detalhes de mídia", "secondary", () => detail(item.site, item.infohash)));
+  }
+  if (torrentMayTransfer(group, "local")) cardActions.append(button("Torrent → Local", "secondary", () => createTorrentTransfers([group], "local")));
+  if (torrentMayTransfer(group, "gdrive")) cardActions.append(button("Torrent → Drive", "primary", () => createTorrentTransfers([group], "gdrive")));
+  footer.append(scope, cardActions);
+
+  const message = document.createElement("p");
+  message.className = "torrent-load-message";
+  message.hidden = true;
+  const details = document.createElement("div");
+  details.className = "torrent-card-details";
+  details.id = `${group.token}-details`;
+  details.hidden = true;
+  toggle.setAttribute("aria-controls", details.id);
+  group.elements = { card, toggle, message, details };
+  toggle.onclick = async () => {
+    const open = toggle.getAttribute("aria-expanded") !== "true";
+    toggle.setAttribute("aria-expanded", String(open));
+    details.hidden = !open;
+    if (open && !group.loaded) {
+      try { await loadTorrentFiles(group); } catch (error) { showError(error); }
+    }
+  };
+  card.append(head, summary, typeLine, footer, message, details);
+  return card;
 }
 
 async function files() {
@@ -704,85 +1124,52 @@ async function files() {
   const selectedSource = $("[data-files-site]").value;
   const selectedType = $("[data-kind]").value;
   const params = new URLSearchParams({
+    view: "torrents",
     q: $("[data-files-query]").value,
     source: selectedSource,
-    site: selectedSource === "local" ? "" : selectedSource,
     type: selectedType,
     kind: selectedType,
     status: $("[data-files-status]").value,
     presence: $("[data-presence]").value,
-    group_by: $("[data-group-by]").value,
+    group_by: "type",
     page: String(state.pages.files),
-    per_page: "100",
+    per_page: "40",
   });
   const requestId = ++state.filesRequest;
   const data = await api(`/api/files?${params}`);
   if (requestId !== state.filesRequest) return;
   const items = Array.isArray(data.items) ? data.items : [];
-  state.filesItems = items;
+  state.filesItems = [];
+  state.fileTorrents.clear();
+  state.selectedTorrents.clear();
   state.selectedFiles.clear();
-  $("[data-files-total]").textContent = `${formatNumber(data.total)} arquivos`;
-  renderFileGroups(data.groups, data.group_by || $("[data-group-by]").value);
-  const body = $("[data-files-body]");
-  body.replaceChildren();
-  items.forEach((item) => {
-    const row = document.createElement("tr");
-    const selectCell = document.createElement("td");
-    selectCell.className = "select-column";
-    const select = document.createElement("input");
-    select.type = "checkbox";
-    select.dataset.fileSelect = fileKey(item);
-    select.setAttribute("aria-label", `Selecionar ${item.path || item.display_name || "arquivo"}`);
-    select.disabled = !canTransfer(item, "local") && !canTransfer(item, "gdrive");
-    select.onchange = () => {
-      if (select.checked) state.selectedFiles.set(fileKey(item), item);
-      else state.selectedFiles.delete(fileKey(item));
-      updateSelectionUI();
+  const totalTorrents = data.total_torrents ?? data.total;
+  const pageFiles = items.reduce((total, item) => total + torrentFileCount(item), 0);
+  $("[data-files-total]").textContent = `${formatNumber(totalTorrents)} torrent(s) · ${formatNumber(pageFiles)} arquivo(s) filtrado(s) nesta página`;
+  renderFileGroups(data.groups, data.group_by || "type");
+  const target = $("[data-torrent-list]");
+  target.replaceChildren();
+  const filters = torrentFilters();
+  items.forEach((item, index) => {
+    const key = torrentSelectionKey(item);
+    const group = {
+      key,
+      token: `torrent-${requestId}-${index + 1}`,
+      summary: item,
+      filters: { ...filters },
+      files: [],
+      page: 0,
+      pages: 1,
+      total: torrentFileCount(item),
+      loaded: false,
+      loading: null,
+      elements: null,
     };
-    selectCell.append(select);
-    const nameCell = document.createElement("td");
-    nameCell.className = "file-main";
-    const name = document.createElement("strong");
-    name.textContent = item.path?.split(/[\\/]/).at(-1) || item.display_name || item.path || "Arquivo sem nome";
-    const context = document.createElement("small");
-    context.textContent = `${item.title || item.display_name || item.infohash || "Sem título"} · ${item.path || "caminho não informado"}`;
-    nameCell.append(name, context);
-    const kindCell = document.createElement("td");
-    const kind = document.createElement("span");
-    kind.className = "kind-badge";
-    kind.textContent = kindLabel(kindOf(item));
-    kindCell.append(kind);
-    const sourceCell = document.createElement("td");
-    const source = document.createElement("span");
-    source.className = `source-badge ${sourceOf(item)}`;
-    source.textContent = sourceLabel(sourceOf(item));
-    sourceCell.append(source);
-    const statusCell = document.createElement("td");
-    const status = document.createElement("span");
-    const rawStatus = item.presence_confidence === "possible" && item.status !== "available"
-      ? "possible"
-      : item.status || (hasLocation(item, "local") || hasLocation(item, "gdrive") ? "available" : "cataloged");
-    status.className = `status-badge ${statusClass(rawStatus)}`;
-    status.textContent = statusLabel(rawStatus);
-    statusCell.append(status);
-    const locationCell = document.createElement("td");
-    locationCell.className = "file-location";
-    locationCell.textContent = locationText(item);
-    const sizeCell = document.createElement("td");
-    sizeCell.textContent = bytes(item.size);
-    const actionsCell = document.createElement("td");
-    const actions = document.createElement("div");
-    actions.className = "row-actions";
-    const detailSite = transferSiteOf(item);
-    if (detailSite && item.infohash) actions.append(button("Abrir", "", () => detail(detailSite, item.infohash)));
-    if (canTransfer(item, "local")) actions.append(button("Manter local", "", () => createTransfer(item, "local")));
-    if (canTransfer(item, "gdrive")) actions.append(button("Enviar ao Drive", "", () => createTransfer(item, "gdrive")));
-    actionsCell.append(actions);
-    row.append(selectCell, nameCell, kindCell, sourceCell, statusCell, locationCell, sizeCell, actionsCell);
-    body.append(row);
+    state.fileTorrents.set(key, group);
+    target.append(renderTorrentCard(group));
   });
   $("[data-files-empty]").hidden = items.length !== 0;
-  $(".table-shell").hidden = items.length === 0;
+  target.hidden = items.length === 0;
   updateSelectionUI();
   renderPagination("files", data, files);
 }
@@ -953,11 +1340,11 @@ async function createTransfers(items, target) {
     updateSelectionUI();
     await dashboard();
     resetPage("transfers");
-    if (state.selectedFiles.size === 0) {
+    if (state.selectedFiles.size === 0 && state.selectedTorrents.size === 0) {
       setView("transfers");
       $("#tab-transfers")?.focus();
     }
-    else toast(`${formatNumber(state.selectedFiles.size)} item(ns) permaneceram selecionados para outra ação ou nova tentativa.`);
+    else toast(`${formatNumber(state.selectedTorrents.size)} torrent(s) e ${formatNumber(state.selectedFiles.size)} arquivo(s) permaneceram selecionados.`);
   }
   if (failures.length) toast(`${formatNumber(failures.length)} grupo(s) não puderam ser enfileirados: ${failures[0].message}`, true);
   return results;
@@ -1334,7 +1721,6 @@ $("[data-files-site]").onchange = () => {
 $("[data-kind]").onchange = () => { syncTypeControls(); resetPage("files"); files().catch(showError); };
 $("[data-files-status]").onchange = () => { resetPage("files"); files().catch(showError); };
 $("[data-presence]").onchange = () => { resetPage("files"); files().catch(showError); };
-$("[data-group-by]").onchange = () => { resetPage("files"); files().catch(showError); };
 $$('[data-type-filter]').forEach((control) => {
   control.onclick = () => {
     $("[data-kind]").value = control.dataset.typeFilter;
@@ -1344,16 +1730,20 @@ $$('[data-type-filter]').forEach((control) => {
   };
 });
 $("[data-select-visible]").onchange = (event) => {
-  state.filesItems.forEach((item) => {
-    const key = fileKey(item);
-    if (event.currentTarget.checked && (canTransfer(item, "local") || canTransfer(item, "gdrive"))) state.selectedFiles.set(key, item);
-    else state.selectedFiles.delete(key);
-  });
+  if (event.currentTarget.checked) {
+    state.fileTorrents.forEach((group) => {
+      state.selectedTorrents.set(group.key, group);
+      group.files.forEach((item) => state.selectedFiles.delete(fileKey(item)));
+    });
+  } else {
+    state.selectedTorrents.clear();
+    state.selectedFiles.clear();
+  }
   updateSelectionUI();
 };
 $("[data-clear-selection]").onclick = clearFileSelection;
-$("[data-bulk-local]").onclick = () => createTransfers(Array.from(state.selectedFiles.values()), "local").catch(showError);
-$("[data-bulk-drive]").onclick = () => createTransfers(Array.from(state.selectedFiles.values()), "gdrive").catch(showError);
+$("[data-bulk-local]").onclick = () => createSelectedTransfers("local").catch(showError);
+$("[data-bulk-drive]").onclick = () => createSelectedTransfers("gdrive").catch(showError);
 $("[data-refresh-transfers]").onclick = () => transfers().catch(showError);
 startButton.onclick = () => startPlayback(true);
 $("[data-close]").onclick = async () => { await destroySession(); $("[data-player]").hidden = true; };

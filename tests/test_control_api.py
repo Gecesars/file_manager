@@ -661,7 +661,8 @@ def test_http_routes_keep_security_headers_and_translate_errors(
     assert client.get("/api/dashboard").get_json() == {"titles": 1}
     assert client.get("/api/files").status_code == 200
     grouped_files = client.get(
-        "/api/files?source=local&kind=video&status=available&group_by=type"
+        f"/api/files?source=local&origin_site=filecr&infohash={INFOHASH}"
+        "&view=torrents&kind=video&status=available&group_by=type"
     )
     assert grouped_files.status_code == 200
     assert file_queries[-1]["source"] == "local"
@@ -669,6 +670,9 @@ def test_http_routes_keep_security_headers_and_translate_errors(
     assert file_queries[-1]["kind"] == "video"
     assert file_queries[-1]["status"] == "available"
     assert file_queries[-1]["group_by"] == "type"
+    assert file_queries[-1]["view"] == "torrents"
+    assert file_queries[-1]["infohash"] == INFOHASH
+    assert file_queries[-1]["origin_site"] == "filecr"
     assert client.get("/api/transfers").status_code == 200
     assert (
         client.post(

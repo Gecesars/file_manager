@@ -15,6 +15,7 @@ from ofc_media.file_kinds import (
 from ofc_media.inventory import (
     DASHBOARD_SQL,
     EXPLORER_SQL,
+    TORRENT_EXPLORER_SQL,
     TRANSFERS_SQL,
     InventoryService,
 )
@@ -184,6 +185,8 @@ def test_explorer_is_parameterized_and_reports_possible_presence():
     assert params == {
         "q": "%100\\%\\_' OR true --%",
         "site": "1337x",
+        "origin_site": None,
+        "infohash": None,
         "kind": "video",
         "presence": "possible",
         "status": None,
@@ -474,6 +477,8 @@ def test_local_source_exposes_original_and_physical_locations_and_type_groups():
     assert params == {
         "q": None,
         "site": "local",
+        "origin_site": None,
+        "infohash": None,
         "kind": "video",
         "presence": None,
         "status": "available",
@@ -492,6 +497,141 @@ def test_explorer_source_status_and_group_filters_are_bounded():
         service.explorer(status="moving")
     with pytest.raises(ValueError, match="group_by invalido"):
         service.explorer(group_by="arbitrary_sql")
+    with pytest.raises(ValueError, match="view invalido"):
+        service.explorer(view="rows")
+    with pytest.raises(ValueError, match="infohash"):
+        service.explorer(infohash="not-a-hash")
+    with pytest.raises(ValueError, match="origin_site invalido"):
+        service.explorer(origin_site="filesystem")
+    with pytest.raises(ValueError, match="conflitantes"):
+        service.explorer(source="filecr", origin_site="1337x")
+
+
+def test_torrent_explorer_paginates_lightweight_torrent_summaries():
+    infohash = "a" * 40
+    database = FakeDatabase(
+        {
+            "total_count": 1,
+            "items": [
+                {
+                    "torrent_id": 77,
+                    "site": "filecr",
+                    "source": "local",
+                    "infohash": infohash,
+                    "title": "Example Release",
+                    "category": "Series",
+                    "file_count": 302,
+                    "matched_file_count": 302,
+                    "total_files": 400,
+                    "bytes": 123456,
+                    "matched_bytes": 123456,
+                    "total_bytes": 223456,
+                    "types": '{"video":{"count":300,"files":300,"bytes":120000}}',
+                    "status_counts": {"available": 300, "cataloged": 2},
+                    "presence_counts": {"local": 300, "missing": 2},
+                    "location_counts": {"local": 300, "torrent": 2},
+                    "status": "partial",
+                    "presence": "mixed",
+                    "location_group": "mixed",
+                }
+            ],
+            "groups": [
+                {
+                    "key": "video",
+                    "count": 1,
+                    "torrents": 1,
+                    "files": 300,
+                    "bytes": 120000,
+                }
+            ],
+        }
+    )
+
+    page = InventoryService(database).explorer(
+        source="local",
+        origin_site="FILECR",
+        infohash=infohash.upper(),
+        view="TORRENTS",
+        group_by="type",
+        page=2,
+        page_size=10,
+    )
+
+    sql, params = database.calls[0]
+    assert sql == TORRENT_EXPLORER_SQL
+    assert params["site"] == "local"
+    assert params["origin_site"] == "filecr"
+    assert params["infohash"] == infohash
+    assert params["limit"] == 10
+    assert params["offset"] == 10
+    assert page.total == 1
+    assert page.view == "torrents"
+    item = page.items[0]
+    assert item["id"] == f"filecr:{infohash}"
+    assert item["site"] == "filecr"
+    assert item["source"] == "local"
+    assert item["file_count"] == 302
+    assert item["matched_file_count"] == 302
+    assert item["total_files"] == 400
+    assert item["matched_bytes"] == 123456
+    assert item["total_bytes"] == 223456
+    assert item["types"]["video"]["count"] == 300
+    assert "files" not in item
+    assert page.as_dict()["view"] == "torrents"
+    assert page.as_dict()["total_torrents"] == 1
+    assert page.as_dict()["groups"][0]["torrents"] == 1
+
+
+def test_torrent_explorer_sql_counts_torrents_and_keeps_file_metrics():
+    assert "count(DISTINCT (site,torrent_id)) AS torrent_count" in TORRENT_EXPLORER_SQL
+    assert "(SELECT count(*) FROM torrent_keys) AS total_count" in TORRENT_EXPLORER_SQL
+    assert "LIMIT %(limit)s OFFSET %(offset)s" in TORRENT_EXPLORER_SQL
+    assert "FROM torrent_page_files" in TORRENT_EXPLORER_SQL
+    assert "AS status_counts" in TORRENT_EXPLORER_SQL
+    assert "AS presence_counts" in TORRENT_EXPLORER_SQL
+    assert "AS location_counts" in TORRENT_EXPLORER_SQL
+    assert "max(torrent_file_totals.total_files) AS total_files" in TORRENT_EXPLORER_SQL
+    assert "jsonb_agg(to_jsonb(selected)" not in TORRENT_EXPLORER_SQL
+
+
+def test_file_view_lazy_loads_an_exact_local_torrent_with_bounded_pagination():
+    infohash = "b" * 40
+    database = FakeDatabase(
+        {
+            "total_count": 250,
+            "items": [
+                {
+                    "file_id": 901,
+                    "site": "1337x",
+                    "infohash": infohash,
+                    "path": "Release/part-201.bin",
+                    "file_kind": "other",
+                    "local_present": True,
+                }
+            ],
+        }
+    )
+
+    page = InventoryService(database).explorer(
+        view="files",
+        source="local",
+        origin_site="1337x",
+        infohash=infohash,
+        page=2,
+        page_size=200,
+    )
+
+    sql, params = database.calls[0]
+    assert sql == EXPLORER_SQL
+    assert params["site"] == "local"
+    assert params["origin_site"] == "1337x"
+    assert params["infohash"] == infohash
+    assert params["limit"] == 200
+    assert params["offset"] == 200
+    assert page.total == 250
+    assert page.as_dict()["pages"] == 2
+    assert page.items[0]["file_id"] == 901
+    assert page.items[0]["site"] == "1337x"
 
 
 def test_explorer_sql_keeps_logical_paths_separate_from_physical_locations():
@@ -500,6 +640,8 @@ def test_explorer_sql_keeps_logical_paths_separate_from_physical_locations():
     assert "drive_match.relative_path AS drive_relative_path" in EXPLORER_SQL
     assert "AS locations" in EXPLORER_SQL
     assert "CAST(%(status)s AS text) IS NULL" in EXPLORER_SQL
+    assert "CAST(%(origin_site)s AS text) IS NULL" in EXPLORER_SQL
+    assert "CAST(%(infohash)s AS text) IS NULL" in EXPLORER_SQL
     assert "CASE CAST(%(group_by)s AS text)" in EXPLORER_SQL
     assert "CAST(%(site)s AS text)='local'" in EXPLORER_SQL
 

@@ -185,11 +185,11 @@
 
     <section class="workspace" id="panel-files" data-view="files" role="tabpanel" aria-labelledby="tab-files" hidden>
       <div class="section-head">
-        <div><span class="eyebrow">Explorador</span><h2 data-files-heading>Todos os arquivos</h2><p class="section-context" data-files-context>Drive, área local e inventário torrent em uma única busca.</p></div>
+        <div><span class="eyebrow">Explorador</span><h2 data-files-heading>Torrents e seus arquivos</h2><p class="section-context" data-files-context>Cada torrent é uma unidade principal. Expanda um card para explorar seus arquivos.</p></div>
         <span class="result-count" data-files-total aria-live="polite"></span>
       </div>
       <div class="type-filter" aria-labelledby="type-filter-title">
-        <div class="type-filter-heading"><strong id="type-filter-title">Selecionar por tipo</strong><span>O agrupamento abaixo controla os itens visíveis.</span></div>
+        <div class="type-filter-heading"><strong id="type-filter-title">Filtrar por tipo</strong><span>Os resultados continuam organizados por torrent.</span></div>
         <div class="type-filter-options" data-type-filters role="group" aria-label="Tipos de arquivo">
           <button class="type-filter-button active" data-type-filter="" type="button" aria-pressed="true">Todos</button>
           <button class="type-filter-button" data-type-filter="video" type="button" aria-pressed="false">Vídeo</button>
@@ -209,27 +209,24 @@
         <select data-kind aria-label="Tipo"><option value="">Todos os tipos</option><option value="video">Vídeo</option><option value="audio">Áudio</option><option value="subtitle">Legenda</option><option value="image">Imagem</option><option value="document">Documento</option><option value="archive">Arquivo compactado</option><option value="software">Software</option><option value="dataset">Dataset</option><option value="other">Outros</option></select>
         <select data-files-status aria-label="Status"><option value="">Todos os status</option></select>
         <select data-presence aria-label="Presença"><option value="">Qualquer presença</option><option value="gdrive">Já está no Drive</option><option value="not_gdrive">Fora do Drive</option><option value="local">Disponível localmente</option><option value="both">Local e Drive</option><option value="missing">Sem cópia disponível</option><option value="exact">Correspondência exata</option><option value="possible">Possível duplicata</option></select>
-        <select data-group-by aria-label="Agrupar por"><option value="type">Agrupar por tipo</option><option value="source">Agrupar por fonte</option><option value="status">Agrupar por status</option><option value="presence">Agrupar por presença</option><option value="location">Agrupar por localização</option></select>
         <button class="primary" data-files-search type="button">Pesquisar</button>
       </div>
-      <div class="file-groups" data-file-groups aria-label="Resumo dos grupos"></div>
+      <div class="file-groups" data-file-groups aria-label="Resumo secundário por tipo"></div>
+      <div class="loaded-selection-bar" data-loaded-selection>
+        <label><input data-select-visible type="checkbox"> Selecionar todos os torrents desta página</label>
+        <span data-loaded-files-count>Expanda um torrent para carregar seus arquivos; selecionar o card abrange o torrent filtrado inteiro.</span>
+      </div>
       <div class="bulk-bar" data-bulk-bar hidden>
-        <div><strong data-selected-count aria-live="polite">0 arquivos selecionados</strong><span>A seleção considera somente os itens visíveis e filtrados. A árvore de pastas será preservada em cada raiz classificada.</span></div>
+        <div><strong data-selected-count aria-live="polite">0 torrents selecionados</strong><span>O checkbox do torrent abrange todos os arquivos filtrados; os checkboxes internos fazem seleção individual entre os arquivos carregados. A árvore de pastas será preservada.</span></div>
         <div class="bulk-actions">
           <button class="secondary" data-clear-selection type="button">Limpar seleção</button>
           <button class="secondary" data-bulk-local type="button">Manter no Local</button>
           <button class="primary" data-bulk-drive type="button">Disponibilizar no Drive</button>
         </div>
       </div>
-      <div class="table-shell" role="region" aria-label="Tabela de arquivos" tabindex="0">
-        <table>
-          <caption class="sr-only">Arquivos encontrados no inventário unificado</caption>
-          <thead><tr><th class="select-column"><label><input data-select-visible type="checkbox"><span class="sr-only">Selecionar itens visíveis e filtrados</span></label></th><th>Arquivo</th><th>Tipo</th><th>Origem</th><th>Status</th><th>Localização</th><th>Tamanho</th><th><span class="sr-only">Ações</span></th></tr></thead>
-          <tbody data-files-body></tbody>
-        </table>
-      </div>
-      <div class="empty" data-files-empty hidden><strong>Nenhum arquivo encontrado</strong><span>Os bancos continuam sendo sincronizados em segundo plano.</span></div>
-      <nav class="pagination" data-files-pagination aria-label="Paginação dos arquivos" hidden>
+      <div class="torrent-list" data-torrent-list aria-label="Torrents encontrados"></div>
+      <div class="empty" data-files-empty hidden><strong>Nenhum torrent encontrado</strong><span>Os bancos continuam sendo sincronizados em segundo plano.</span></div>
+      <nav class="pagination" data-files-pagination aria-label="Paginação dos torrents" hidden>
         <button class="secondary" data-files-prev type="button">Anterior</button>
         <span data-files-page aria-live="polite"></span>
         <button class="secondary" data-files-next type="button">Próxima</button>

@@ -12,6 +12,7 @@ SOURCE_CARDS = ("gdrive", "filecr", "1337x", "local")
 EXPLORER_SITES = SITES | {"torrent", "local"}
 EXPLORER_STATUSES = frozenset({"available", "cataloged"})
 EXPLORER_GROUPS = frozenset({"type", "status", "source", "presence", "location"})
+EXPLORER_VIEWS = frozenset({"files", "torrents"})
 SOURCE_METADATA: dict[str, tuple[str, str, str]] = {
     "gdrive": ("Google Drive", "Google Drive", "gdrive"),
     "filecr": ("FileCR", "Catalogo FileCR", "torrent"),
@@ -199,7 +200,7 @@ SELECT
 """
 
 
-EXPLORER_SQL = r"""
+_EXPLORER_SELECTED_SQL = r"""
 WITH completed_local_files AS MATERIALIZED (
     SELECT DISTINCT selected.file_id
     FROM runtime.transfer_jobs local_job
@@ -226,6 +227,45 @@ WITH completed_local_files AS MATERIALIZED (
           local_manifest.value->>'relative_path',
           local_manifest.value->>'path'
       )
+), torrent_file_totals AS NOT MATERIALIZED (
+    SELECT f.torrent_id,t.site,count(*) AS total_files,
+           COALESCE(sum(f.size), 0) AS total_bytes
+    FROM catalog.torrent_files f
+    JOIN catalog.torrents t ON t.id=f.torrent_id
+    LEFT JOIN completed_local_files persistent_local
+      ON persistent_local.file_id=f.id
+    WHERE (
+          t.active
+          OR (CAST(%(site)s AS text)='local'
+              AND persistent_local.file_id IS NOT NULL)
+      )
+      AND (
+          t.site <> 'gdrive'
+          OR EXISTS (
+              SELECT 1 FROM catalog.drive_files own_drive
+              WHERE own_drive.torrent_file_id=f.id
+                AND own_drive.active AND own_drive.can_download
+          )
+          OR (CAST(%(site)s AS text)='local'
+              AND persistent_local.file_id IS NOT NULL)
+      )
+      AND (
+          CAST(%(site)s AS text) IS NULL
+          OR t.site=CAST(%(site)s AS text)
+          OR (CAST(%(site)s AS text)='torrent'
+              AND t.site IN ('filecr','1337x'))
+          OR (CAST(%(site)s AS text)='local'
+              AND persistent_local.file_id IS NOT NULL)
+      )
+      AND (
+          CAST(%(origin_site)s AS text) IS NULL
+          OR t.site=CAST(%(origin_site)s AS text)
+      )
+      AND (
+          CAST(%(infohash)s AS text) IS NULL
+          OR lower(trim(t.infohash))=CAST(%(infohash)s AS text)
+      )
+    GROUP BY f.torrent_id,t.site
 ), candidate_files AS NOT MATERIALIZED (
     SELECT
         f.id AS file_id,
@@ -272,6 +312,14 @@ WITH completed_local_files AS MATERIALIZED (
           OR (CAST(%(site)s AS text)='torrent'
               AND t.site IN ('filecr','1337x'))
           OR CAST(%(site)s AS text)='local'
+      )
+      AND (
+          CAST(%(origin_site)s AS text) IS NULL
+          OR t.site=CAST(%(origin_site)s AS text)
+      )
+      AND (
+          CAST(%(infohash)s AS text) IS NULL
+          OR lower(trim(t.infohash))=CAST(%(infohash)s AS text)
       )
       AND (CAST(%(kind)s AS text) IS NULL OR f.file_kind=CAST(%(kind)s AS text))
       AND (
@@ -503,7 +551,12 @@ WITH completed_local_files AS MATERIALIZED (
         )
         AND (CAST(%(status)s AS text) IS NULL
              OR status=CAST(%(status)s AS text))
-), groupable AS (
+)
+"""
+
+
+EXPLORER_SQL = _EXPLORER_SELECTED_SQL + r"""
+, groupable AS (
     SELECT
         CASE CAST(%(group_by)s AS text)
             WHEN 'type' THEN type
@@ -544,6 +597,188 @@ SELECT
                     'key', group_key,
                     'label', group_key,
                     'count', file_count,
+                    'files', file_count,
+                    'bytes', bytes_total
+                ) ORDER BY group_key
+            )
+            FROM grouped
+        ),
+        '[]'::jsonb
+    ) AS groups
+"""
+
+
+TORRENT_EXPLORER_SQL = _EXPLORER_SELECTED_SQL + r"""
+, torrent_keys AS (
+    SELECT torrent_id,site,infohash,title,display_name,category
+    FROM selected
+    GROUP BY torrent_id,site,infohash,title,display_name,category
+), paged_torrents AS (
+    SELECT *
+    FROM torrent_keys
+    ORDER BY site,title,infohash,torrent_id
+    LIMIT %(limit)s OFFSET %(offset)s
+), torrent_page_files AS (
+    SELECT selected.*
+    FROM selected
+    JOIN paged_torrents USING (torrent_id,site)
+), torrent_type_counts AS (
+    SELECT torrent_id,site,file_kind,count(*) AS file_count,
+           COALESCE(sum(size), 0) AS bytes_total
+    FROM torrent_page_files
+    GROUP BY torrent_id,site,file_kind
+), torrent_types AS (
+    SELECT torrent_id,site,jsonb_object_agg(
+        file_kind,
+        jsonb_build_object(
+            'count', file_count,
+            'files', file_count,
+            'bytes', bytes_total
+        ) ORDER BY file_kind
+    ) AS types
+    FROM torrent_type_counts
+    GROUP BY torrent_id,site
+), torrent_status_counts AS (
+    SELECT torrent_id,site,status,count(*) AS file_count
+    FROM torrent_page_files
+    GROUP BY torrent_id,site,status
+), torrent_statuses AS (
+    SELECT torrent_id,site,jsonb_object_agg(status, file_count ORDER BY status)
+           AS status_counts
+    FROM torrent_status_counts
+    GROUP BY torrent_id,site
+), torrent_presence_counts AS (
+    SELECT torrent_id,site,presence,count(*) AS file_count
+    FROM torrent_page_files
+    GROUP BY torrent_id,site,presence
+), torrent_presences AS (
+    SELECT torrent_id,site,jsonb_object_agg(presence, file_count ORDER BY presence)
+           AS presence_counts
+    FROM torrent_presence_counts
+    GROUP BY torrent_id,site
+), torrent_location_counts AS (
+    SELECT torrent_id,site,location_group,count(*) AS file_count
+    FROM torrent_page_files
+    GROUP BY torrent_id,site,location_group
+), torrent_locations AS (
+    SELECT torrent_id,site,jsonb_object_agg(
+        location_group, file_count ORDER BY location_group
+    ) AS location_counts
+    FROM torrent_location_counts
+    GROUP BY torrent_id,site
+), torrent_rows AS (
+    SELECT
+        page_file.torrent_id,
+        page_file.site,
+        min(page_file.source) AS source,
+        page_file.infohash,
+        page_file.title,
+        page_file.display_name,
+        page_file.category,
+        count(*) AS file_count,
+        count(*) AS matched_file_count,
+        max(torrent_file_totals.total_files) AS total_files,
+        COALESCE(sum(page_file.size), 0) AS bytes,
+        COALESCE(sum(page_file.size), 0) AS matched_bytes,
+        max(torrent_file_totals.total_bytes) AS total_bytes,
+        COALESCE(sum(page_file.size), 0) AS size,
+        count(*) FILTER (WHERE page_file.status='available')
+            AS available_file_count,
+        count(*) FILTER (WHERE page_file.status='cataloged')
+            AS cataloged_file_count,
+        count(*) FILTER (WHERE page_file.local_present) AS local_file_count,
+        count(*) FILTER (
+            WHERE page_file.drive_file_id IS NOT NULL
+              AND page_file.drive_match_confidence='exact'
+        ) AS gdrive_file_count,
+        CASE
+            WHEN count(DISTINCT page_file.file_kind)=1 THEN min(page_file.file_kind)
+            ELSE 'mixed'
+        END AS type,
+        CASE
+            WHEN count(DISTINCT page_file.file_kind)=1 THEN min(page_file.file_kind)
+            ELSE 'mixed'
+        END AS file_kind,
+        CASE
+            WHEN count(*) FILTER (WHERE page_file.status='available')=count(*)
+                THEN 'available'
+            WHEN count(*) FILTER (WHERE page_file.status='cataloged')=count(*)
+                THEN 'cataloged'
+            ELSE 'partial'
+        END AS status,
+        CASE
+            WHEN count(DISTINCT page_file.presence)=1 THEN min(page_file.presence)
+            ELSE 'mixed'
+        END AS presence,
+        CASE
+            WHEN count(DISTINCT page_file.location_group)=1
+                THEN min(page_file.location_group)
+            ELSE 'mixed'
+        END AS location_group,
+        CASE
+            WHEN count(DISTINCT page_file.location_kind)=1
+                THEN min(page_file.location_kind)
+            ELSE 'mixed'
+        END AS location_kind,
+        torrent_types.types,
+        torrent_statuses.status_counts,
+        torrent_presences.presence_counts,
+        torrent_locations.location_counts
+    FROM torrent_page_files page_file
+    JOIN torrent_file_totals USING (torrent_id,site)
+    JOIN torrent_types USING (torrent_id,site)
+    JOIN torrent_statuses USING (torrent_id,site)
+    JOIN torrent_presences USING (torrent_id,site)
+    JOIN torrent_locations USING (torrent_id,site)
+    GROUP BY
+        page_file.torrent_id,page_file.site,page_file.infohash,page_file.title,
+        page_file.display_name,page_file.category,torrent_types.types,
+        torrent_statuses.status_counts,torrent_presences.presence_counts,
+        torrent_locations.location_counts
+), groupable AS (
+    SELECT
+        CASE CAST(%(group_by)s AS text)
+            WHEN 'type' THEN type
+            WHEN 'status' THEN status
+            WHEN 'source' THEN source
+            WHEN 'presence' THEN presence
+            WHEN 'location' THEN location_group
+            ELSE NULL
+        END AS group_key,
+        torrent_id,
+        site,
+        size
+    FROM selected
+), grouped AS (
+    SELECT group_key,count(DISTINCT (site,torrent_id)) AS torrent_count,
+           count(*) AS file_count,COALESCE(sum(size), 0) AS bytes_total
+    FROM groupable
+    WHERE group_key IS NOT NULL
+    GROUP BY group_key
+)
+SELECT
+    (SELECT count(*) FROM torrent_keys) AS total_count,
+    COALESCE(
+        (
+            SELECT jsonb_agg(to_jsonb(page_rows)
+                             ORDER BY page_rows.site,page_rows.title,
+                                      page_rows.infohash,page_rows.torrent_id)
+            FROM (
+                SELECT *
+                FROM torrent_rows
+                ORDER BY site,title,infohash,torrent_id
+            ) page_rows
+        ),
+        '[]'::jsonb
+    ) AS items,
+    COALESCE(
+        (
+            SELECT jsonb_agg(
+                jsonb_build_object(
+                    'key', group_key,
+                    'label', group_key,
+                    'count', torrent_count,
+                    'torrents', torrent_count,
                     'files', file_count,
                     'bytes', bytes_total
                 ) ORDER BY group_key
@@ -611,6 +846,7 @@ class Page:
     page_size: int
     groups: list[dict[str, Any]] = field(default_factory=list)
     group_by: str | None = None
+    view: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         payload = {
@@ -623,6 +859,10 @@ class Page:
         if self.group_by is not None:
             payload["group_by"] = self.group_by
             payload["groups"] = self.groups
+        if self.view is not None:
+            payload["view"] = self.view
+            if self.view == "torrents":
+                payload["total_torrents"] = self.total
         return payload
 
 
@@ -661,6 +901,17 @@ def _like_pattern(value: str | None) -> str | None:
         return None
     escaped = normalized.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{escaped}%"
+
+
+def _exact_infohash(value: str | None) -> str | None:
+    if value is None or not value.strip():
+        return None
+    normalized = value.strip().casefold()
+    if len(normalized) != 40 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        raise ValueError("infohash deve conter 40 caracteres hexadecimais")
+    return normalized
 
 
 def _mapping(row: Any) -> dict[str, Any]:
@@ -775,6 +1026,26 @@ def _item_contract(item: dict[str, Any], selected_source: str | None) -> dict[st
                 }
             )
         item["locations"] = locations
+    return item
+
+
+def _torrent_contract(item: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a lightweight torrent summary without embedding its files."""
+
+    site = str(item.get("site") or "")
+    infohash = str(item.get("infohash") or "")
+    item["id"] = f"{site}:{infohash}"
+    for field_name in ("types", "status_counts", "presence_counts", "location_counts"):
+        item[field_name] = _json_object(item.get(field_name), field_name)
+    item["file_count"] = _integer(item.get("file_count"))
+    item["matched_file_count"] = _integer(
+        item.get("matched_file_count", item["file_count"])
+    )
+    item["total_files"] = _integer(item.get("total_files", item["file_count"]))
+    item["bytes"] = _integer(item.get("bytes"))
+    item["matched_bytes"] = _integer(item.get("matched_bytes", item["bytes"]))
+    item["total_bytes"] = _integer(item.get("total_bytes", item["bytes"]))
+    item.setdefault("size", item["bytes"])
     return item
 
 
@@ -936,15 +1207,28 @@ class InventoryService:
         presence: str | None = None,
         status: str | None = None,
         group_by: str | None = None,
+        view: str | None = None,
+        infohash: str | None = None,
+        origin_site: str | None = None,
         page: int = 1,
         page_size: int = 50,
     ) -> Page:
         selected_page, selected_size, limit, offset = _pagination(page, page_size)
         selected_source = _source_filter(site, source)
         selected_group = _validated_optional(group_by, EXPLORER_GROUPS, "group_by")
+        selected_view = _validated_optional(view, EXPLORER_VIEWS, "view") or "files"
+        selected_origin = _validated_optional(origin_site, SITES, "origin_site")
+        if (
+            selected_origin is not None
+            and selected_source in SITES
+            and selected_origin != selected_source
+        ):
+            raise ValueError("source e origin_site conflitantes")
         params = {
             "q": _like_pattern(q),
             "site": selected_source,
+            "origin_site": selected_origin,
+            "infohash": _exact_infohash(infohash),
             "kind": _validated_optional(kind, set(FILE_KINDS), "kind"),
             "presence": _validated_optional(presence, PRESENCE_FILTERS, "presence"),
             "status": _validated_optional(status, EXPLORER_STATUSES, "status"),
@@ -952,11 +1236,13 @@ class InventoryService:
             "limit": limit,
             "offset": offset,
         }
-        row = _mapping(self.database.execute(EXPLORER_SQL, params).fetchone())
-        items = [
-            _item_contract(item, selected_source)
-            for item in _json_list(row.get("items"))
-        ]
+        query = TORRENT_EXPLORER_SQL if selected_view == "torrents" else EXPLORER_SQL
+        row = _mapping(self.database.execute(query, params).fetchone())
+        raw_items = _json_list(row.get("items"))
+        if selected_view == "torrents":
+            items = [_torrent_contract(item) for item in raw_items]
+        else:
+            items = [_item_contract(item, selected_source) for item in raw_items]
         return Page(
             items=items,
             total=int(row.get("total_count") or 0),
@@ -964,6 +1250,7 @@ class InventoryService:
             page_size=selected_size,
             groups=_json_list(row.get("groups")),
             group_by=selected_group,
+            view=selected_view,
         )
 
     def transfers(

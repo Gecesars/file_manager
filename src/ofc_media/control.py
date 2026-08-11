@@ -299,6 +299,9 @@ class ControlPlane:
         source: str | None = None,
         status: str | None = None,
         group_by: str | None = None,
+        view: str | None = None,
+        infohash: str | None = None,
+        origin_site: str | None = None,
     ) -> dict[str, Any]:
         with connection(self.settings) as database:
             selected = InventoryService(database).explorer(
@@ -309,12 +312,22 @@ class ControlPlane:
                 presence=presence,
                 status=status,
                 group_by=group_by,
+                view=view,
+                infohash=infohash,
+                origin_site=origin_site,
                 page=page,  # type: ignore[arg-type]
                 page_size=per_page,  # type: ignore[arg-type]
             )
         payload = _page_payload(selected)
+        if selected.view == "torrents":
+            payload["total_torrents"] = payload["total"]
         for item in payload["items"]:
-            item["id"] = item.get("file_id")
+            if selected.view == "torrents":
+                item.setdefault(
+                    "id", f"{item.get('site', '')}:{item.get('infohash', '')}"
+                )
+            else:
+                item["id"] = item.get("file_id")
         return payload
 
     def transfers(
@@ -1038,6 +1051,9 @@ def create_app() -> Flask:
                 presence=request.args.get("presence"),
                 status=request.args.get("status"),
                 group_by=request.args.get("group_by"),
+                view=request.args.get("view"),
+                infohash=request.args.get("infohash"),
+                origin_site=request.args.get("origin_site"),
                 page=request.args.get("page", "1"),
                 per_page=request.args.get("per_page", "50"),
             )
