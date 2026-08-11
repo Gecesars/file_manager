@@ -8,6 +8,7 @@ from .file_kinds import FILE_KINDS
 
 
 SITES = frozenset({"filecr", "1337x", "gdrive"})
+EXPLORER_SITES = SITES | {"torrent"}
 TRANSFER_STATES = frozenset(
     {
         "queued",
@@ -29,7 +30,23 @@ PRESENCE_FILTERS = frozenset(
 
 
 DASHBOARD_SQL = r"""
-WITH visible_files AS (
+WITH torrent_source_sites(site) AS (
+    VALUES ('filecr'::text), ('1337x'::text)
+), source_torrents AS MATERIALIZED (
+    SELECT t.id,t.site
+    FROM catalog.torrents t
+    WHERE t.active AND t.site IN ('filecr','1337x')
+), source_files AS MATERIALIZED (
+    SELECT f.id,t.site,f.file_kind,f.size
+    FROM catalog.torrent_files f
+    JOIN source_torrents t ON t.id=f.torrent_id
+), drive_presence AS MATERIALIZED (
+    SELECT d.drive_file_id,f.id AS file_id,f.torrent_id,f.file_kind,f.size
+    FROM catalog.drive_files d
+    JOIN catalog.torrent_files f ON f.id=d.torrent_file_id
+    JOIN catalog.torrents t ON t.id=f.torrent_id
+    WHERE d.active AND d.can_download AND t.active AND t.site='gdrive'
+), visible_files AS (
     SELECT f.id,f.file_kind,f.size
     FROM catalog.torrent_files f
     JOIN catalog.torrents t ON t.id=f.torrent_id
@@ -42,11 +59,22 @@ WITH visible_files AS (
           )
       )
 ), local_presence AS (
-    SELECT DISTINCT selected.file_id
+    SELECT DISTINCT f.id AS file_id,f.torrent_id,f.file_kind,f.size
     FROM runtime.transfer_jobs job
     CROSS JOIN LATERAL unnest(job.selected_file_ids) selected(file_id)
-    JOIN visible_files f ON f.id=selected.file_id
-    WHERE job.state='completed' AND jsonb_array_length(job.local_files) > 0
+    JOIN catalog.torrent_files f ON f.id=selected.file_id
+    WHERE job.state='completed'
+      AND jsonb_array_length(job.local_files) > 0
+), torrent_source_stats AS (
+    SELECT
+        sites.site,
+        (SELECT count(*) FROM source_torrents t WHERE t.site=sites.site)
+            AS torrent_count,
+        (SELECT count(*) FROM source_files f WHERE f.site=sites.site)
+            AS file_count,
+        (SELECT COALESCE(sum(f.size), 0) FROM source_files f
+         WHERE f.site=sites.site) AS bytes_total
+    FROM torrent_source_sites sites
 ), kind_counts AS (
     SELECT file_kind, count(*) AS file_count, COALESCE(sum(size), 0) AS bytes_total
     FROM visible_files
@@ -60,9 +88,15 @@ SELECT
     (SELECT count(*) FROM catalog.torrents WHERE active) AS torrent_count,
     (SELECT count(*) FROM visible_files) AS file_count,
     (SELECT COALESCE(sum(size), 0) FROM visible_files) AS bytes_total,
-    (SELECT count(*) FROM catalog.drive_files WHERE active AND can_download)
-        AS gdrive_file_count,
+    (SELECT count(*) FROM source_torrents) AS source_torrent_count,
+    (SELECT count(*) FROM source_files) AS source_file_count,
+    (SELECT COALESCE(sum(size), 0) FROM source_files) AS source_bytes_total,
+    (SELECT count(*) FROM drive_presence) AS gdrive_file_count,
+    (SELECT COALESCE(sum(size), 0) FROM drive_presence) AS gdrive_bytes_total,
+    (SELECT count(DISTINCT torrent_id) FROM drive_presence) AS gdrive_title_count,
     (SELECT count(*) FROM local_presence) AS local_file_count,
+    (SELECT COALESCE(sum(size), 0) FROM local_presence) AS local_bytes_total,
+    (SELECT count(DISTINCT torrent_id) FROM local_presence) AS local_title_count,
     (SELECT count(*) FROM catalog.subtitles WHERE active) AS subtitle_count,
     (SELECT count(*) FROM runtime.transfer_jobs
      WHERE state NOT IN ('completed','failed','cancelled')) AS active_transfer_count,
@@ -75,7 +109,15 @@ SELECT
     COALESCE(
         (SELECT jsonb_object_agg(state, job_count) FROM transfer_counts),
         '{}'::jsonb
-    ) AS transfers_by_state
+    ) AS transfers_by_state,
+    COALESCE(
+        (SELECT jsonb_object_agg(site, jsonb_build_object(
+                    'titles', torrent_count,
+                    'files', file_count,
+                    'bytes', bytes_total
+                ) ORDER BY site) FROM torrent_source_stats),
+        '{}'::jsonb
+    ) AS torrent_sources_by_site
 """
 
 
@@ -112,7 +154,12 @@ WITH candidate_files AS NOT MATERIALIZED (
                 AND own_drive.active AND own_drive.can_download
           )
       )
-      AND (CAST(%(site)s AS text) IS NULL OR t.site=CAST(%(site)s AS text))
+      AND (
+          CAST(%(site)s AS text) IS NULL
+          OR t.site=CAST(%(site)s AS text)
+          OR (CAST(%(site)s AS text)='torrent'
+              AND t.site IN ('filecr','1337x'))
+      )
       AND (CAST(%(kind)s AS text) IS NULL OR f.file_kind=CAST(%(kind)s AS text))
       AND (
           CAST(%(q)s AS text) IS NULL
@@ -372,6 +419,16 @@ def _json_list(value: Any) -> list[dict[str, Any]]:
     return [dict(item) for item in value]
 
 
+def _json_object(value: Any, name: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, str):
+        value = json.loads(value)
+    if not isinstance(value, Mapping):
+        raise TypeError(f"resultado {name} deve ser um objeto JSON")
+    return dict(value)
+
+
 class InventoryService:
     """Read-only inventory queries independent from the HTTP framework.
 
@@ -385,6 +442,32 @@ class InventoryService:
 
     def dashboard(self) -> dict[str, Any]:
         row = _mapping(self.database.execute(DASHBOARD_SQL).fetchone())
+        sources = _json_object(
+            row.get("torrent_sources_by_site"), "torrent_sources_by_site"
+        )
+        row["torrent_sources_by_site"] = sources
+        # Proveniencia e presenca sao dimensoes diferentes: um arquivo de
+        # torrent pode estar simultaneamente local e no Drive. Manter os
+        # dominios separados evita que consumidores somem copias fisicas ao
+        # inventario de origem e inflem um suposto total global.
+        row["domains"] = {
+            "torrent": {
+                "titles": int(row.get("source_torrent_count") or 0),
+                "files": int(row.get("source_file_count") or 0),
+                "bytes": int(row.get("source_bytes_total") or 0),
+                "sources": sources,
+            },
+            "local": {
+                "titles": int(row.get("local_title_count") or 0),
+                "files": int(row.get("local_file_count") or 0),
+                "bytes": int(row.get("local_bytes_total") or 0),
+            },
+            "gdrive": {
+                "titles": int(row.get("gdrive_title_count") or 0),
+                "files": int(row.get("gdrive_file_count") or 0),
+                "bytes": int(row.get("gdrive_bytes_total") or 0),
+            },
+        }
         return row
 
     def explorer(
@@ -400,7 +483,7 @@ class InventoryService:
         selected_page, selected_size, limit, offset = _pagination(page, page_size)
         params = {
             "q": _like_pattern(q),
-            "site": _validated_optional(site, SITES, "site"),
+            "site": _validated_optional(site, EXPLORER_SITES, "site"),
             "kind": _validated_optional(kind, set(FILE_KINDS), "kind"),
             "presence": _validated_optional(presence, PRESENCE_FILTERS, "presence"),
             "limit": limit,

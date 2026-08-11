@@ -52,6 +52,10 @@ function bytes(value) {
   return `${size.toLocaleString("pt-BR", { maximumFractionDigits: index ? 1 : 0 })} ${units[index]}`;
 }
 
+function optionalBytes(value) {
+  return value === undefined || value === null || value === "" ? "—" : bytes(value);
+}
+
 function rate(value) { return `${bytes(value)}/s`; }
 
 function toast(message, error = false) {
@@ -85,7 +89,9 @@ function button(label, className, handler) {
 }
 
 function sourceLabel(site) {
-  return site === "gdrive" ? "Google Drive" : site === "1337x" ? "1337x" : "FileCR";
+  if (site === "gdrive") return "Google Drive";
+  if (site === "torrent") return "Torrents";
+  return site === "1337x" ? "Torrent · 1337x" : "Torrent · FileCR";
 }
 
 function kindLabel(kind) {
@@ -103,7 +109,7 @@ function presenceLabel(item) {
     return ["exact", "No Drive"];
   }
   if (item.presence === "local") return ["local", "Somente local"];
-  return ["missing", "Falta no Drive"];
+  return ["missing", "Somente torrent"];
 }
 
 function renderPagination(name, data, loadPage) {
@@ -154,6 +160,36 @@ function setView(view, updateHash = true) {
 
 function showError(error) { toast(error?.message || String(error), true); }
 
+function setDomainHealth(domain, healthy, readyText, failedText) {
+  const element = $(`[data-domain-health="${domain}"]`);
+  element.textContent = healthy ? readyText : failedText;
+  element.classList.toggle("ok", Boolean(healthy));
+  element.classList.toggle("bad", !healthy);
+}
+
+function setDomainInventoryState(domain, files, readyText, emptyText) {
+  const element = $(`[data-domain-state="${domain}"]`);
+  const available = Number(files || 0) > 0;
+  element.textContent = available ? readyText : emptyText;
+  element.classList.toggle("ready", available);
+  element.classList.toggle("empty-state", !available);
+}
+
+function domainSnapshot(data, name, fallback = {}) {
+  const current = data.domains?.[name] || {};
+  return {
+    files: current.files ?? fallback.files,
+    bytes: current.bytes ?? fallback.bytes,
+    titles: current.titles ?? fallback.titles,
+  };
+}
+
+function renderDomain(name, snapshot) {
+  $(`[data-domain-metric="${name}-files"]`).textContent = snapshot.files == null ? "—" : formatNumber(snapshot.files);
+  $(`[data-domain-metric="${name}-bytes"]`).textContent = optionalBytes(snapshot.bytes);
+  $(`[data-domain-metric="${name}-titles"]`).textContent = snapshot.titles == null ? "—" : formatNumber(snapshot.titles);
+}
+
 async function health() {
   const element = $("[data-health]");
   try {
@@ -162,22 +198,90 @@ async function health() {
     const healthy = entries.filter((name) => services[name]?.healthy).length;
     element.textContent = `${healthy}/${entries.length} serviços saudáveis`;
     element.classList.toggle("bad", healthy !== entries.length);
+    setDomainHealth("gdrive", services["gdrive-source"]?.healthy, "Drive online", "Drive indisponível");
+    setDomainHealth("torrent", services["torrent-engine"]?.healthy, "Motor torrent online", "Motor torrent indisponível");
+    const localHealthy = services.postgres?.healthy && services.redis?.healthy;
+    setDomainHealth("local", localHealthy, "Área local pronta", "Área local indisponível");
   } catch {
     element.textContent = "Monitor indisponível";
     element.classList.add("bad");
+    setDomainHealth("gdrive", false, "Drive online", "Status indisponível");
+    setDomainHealth("torrent", false, "Motor torrent online", "Status indisponível");
+    setDomainHealth("local", false, "Área local pronta", "Status indisponível");
   }
 }
 
 async function dashboard() {
   try {
     const data = await api("/api/dashboard");
-    $("[data-stat='titles']").textContent = formatNumber(data.titles ?? data.torrents);
-    $("[data-stat='files']").textContent = formatNumber(data.files);
-    $("[data-stat='drive']").textContent = formatNumber(data.drive_files ?? data.drive);
+    const totalFiles = Number(data.file_count ?? data.files ?? 0);
+    const driveFiles = Number(data.gdrive_file_count ?? data.drive_files ?? data.drive ?? 0);
+    const gdrive = domainSnapshot(data, "gdrive", { files: driveFiles });
+    const local = domainSnapshot(data, "local", { files: data.local_file_count ?? 0 });
+    const torrent = domainSnapshot(data, "torrent", {
+      files: Math.max(0, totalFiles - driveFiles),
+      bytes: data.bytes_total,
+      titles: data.torrent_count ?? data.titles ?? data.torrents,
+    });
+    renderDomain("gdrive", gdrive);
+    renderDomain("local", local);
+    renderDomain("torrent", torrent);
+    setDomainInventoryState("gdrive", gdrive.files, "Inventário remoto pronto para uso", "Drive ainda não catalogado");
+    setDomainInventoryState("local", local.files, "Downloads locais validados", "Nenhum download local concluído");
+    setDomainInventoryState("torrent", torrent.files, "Inventário torrent disponível", "Inventário torrent ainda vazio");
+    $("[data-stat='files']").textContent = formatNumber(totalFiles);
+    $("[data-stat='bytes']").textContent = optionalBytes(data.bytes_total);
+    $("[data-stat='subtitles']").textContent = formatNumber(data.subtitle_count);
     $("[data-stat='active']").textContent = formatNumber(data.active_transfers ?? data.active);
   } catch {
     $$('[data-stat]').forEach((item) => { item.textContent = "—"; });
+    $$('[data-domain-metric]').forEach((item) => { item.textContent = "—"; });
+    $$('[data-domain-state]').forEach((item) => {
+      item.textContent = "Inventário temporariamente indisponível";
+      item.classList.remove("ready");
+      item.classList.add("empty-state");
+    });
   }
+}
+
+function updateFilesContext() {
+  const site = $("[data-files-site]").value;
+  const presence = $("[data-presence]").value;
+  const contexts = {
+    gdrive: ["Arquivos do Google Drive", "Conteúdo remoto catalogado e disponível para streaming ou download local."],
+    torrent: ["Inventário de torrents", "Arquivos descritos nos metadados FileCR e 1337x, ainda sem exigir download."],
+    local: ["Arquivos locais", "Downloads concluídos e validados na área de armazenamento local."],
+    filecr: ["Inventário FileCR", "Arquivos descobertos pelo coletor FileCR."],
+    "1337x": ["Inventário 1337x", "Arquivos descobertos pelo coletor 1337x."],
+    all: ["Todos os arquivos", "Drive, área local e inventário torrent em uma única busca."],
+  };
+  const selected = site === "gdrive"
+    ? contexts.gdrive
+    : site === "torrent"
+      ? contexts.torrent
+      : presence === "local"
+        ? contexts.local
+        : contexts[site] || contexts.all;
+  $("[data-files-heading]").textContent = selected[0];
+  $("[data-files-context]").textContent = selected[1];
+}
+
+function openFilesDomain(domain) {
+  const filters = {
+    all: { site: "", presence: "" },
+    gdrive: { site: "gdrive", presence: "" },
+    local: { site: "", presence: "local" },
+    torrent: { site: "torrent", presence: "" },
+  }[domain] || { site: "", presence: "" };
+  $("[data-files-query]").value = "";
+  $("[data-files-site]").value = filters.site;
+  $("[data-kind]").value = "";
+  $("[data-presence]").value = filters.presence;
+  resetPage("files");
+  updateFilesContext();
+  setView("files");
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  window.requestAnimationFrame(() => $("#panel-files").scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "start" }));
 }
 
 async function categories() {
@@ -234,6 +338,7 @@ async function catalog() {
 }
 
 async function files() {
+  updateFilesContext();
   const params = new URLSearchParams({
     q: $("[data-files-query]").value,
     site: $("[data-files-site]").value,
@@ -464,6 +569,7 @@ async function transfers() {
 
 async function syncDrive() {
   const trigger = $("[data-sync-drive]");
+  const originalLabel = trigger.textContent;
   trigger.disabled = true;
   trigger.textContent = "Sincronizando…";
   try {
@@ -471,10 +577,14 @@ async function syncDrive() {
     toast(result.status === "already_syncing"
       ? "A sincronização do Google Drive já está em andamento."
       : "Sincronização do Google Drive solicitada em segundo plano.");
+    const driveState = $('[data-domain-state="gdrive"]');
+    driveState.textContent = "Sincronização do inventário em andamento";
+    driveState.classList.remove("empty-state");
+    driveState.classList.add("ready");
   } catch (error) { showError(error); }
   finally {
     trigger.disabled = false;
-    trigger.textContent = "Sincronizar Drive";
+    trigger.textContent = originalLabel;
   }
 }
 
@@ -748,6 +858,9 @@ $$('[data-view-button]').forEach((item, index, tabs) => {
 });
 $("[data-health]").onclick = () => health();
 $("[data-sync-drive]").onclick = syncDrive;
+$("[data-open-all]").onclick = () => openFilesDomain("all");
+$("[data-open-transfers]").onclick = () => setView("transfers");
+$$('[data-open-domain]').forEach((item) => { item.onclick = () => openFilesDomain(item.dataset.openDomain); });
 $("[data-catalog-search]").onclick = () => { resetPage("catalog"); catalog().catch(showError); };
 $("[data-catalog-query]").onkeydown = (event) => {
   if (event.key === "Enter") { resetPage("catalog"); catalog().catch(showError); }

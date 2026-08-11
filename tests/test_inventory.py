@@ -228,11 +228,47 @@ def test_video_catalog_counts_only_downloadable_active_drive_files():
 
 def test_dashboard_and_transfer_queries_do_not_need_flask_or_postgres():
     database = FakeDatabase(
-        {"torrent_count": 12, "file_count": 34, "files_by_kind": {"video": {"count": 2}}},
+        {
+            "torrent_count": 12,
+            "file_count": 34,
+            "source_torrent_count": 10,
+            "source_file_count": 29,
+            "source_bytes_total": 1_000,
+            "local_file_count": 3,
+            "local_bytes_total": 300,
+            "local_title_count": 2,
+            "gdrive_file_count": 5,
+            "gdrive_bytes_total": 500,
+            "gdrive_title_count": 4,
+            "files_by_kind": {"video": {"count": 2}},
+            "torrent_sources_by_site": {
+                "filecr": {
+                    "titles": 6,
+                    "files": 19,
+                    "bytes": 600,
+                },
+                "1337x": {
+                    "titles": 4,
+                    "files": 10,
+                    "bytes": 400,
+                },
+            },
+        },
         {"total_count": 1, "items": [{"id": "job", "state": "queued"}]},
     )
     service = InventoryService(database)
-    assert service.dashboard()["torrent_count"] == 12
+    dashboard = service.dashboard()
+    assert dashboard["torrent_count"] == 12
+    assert dashboard["domains"] == {
+        "torrent": {
+            "titles": 10,
+            "files": 29,
+            "bytes": 1_000,
+            "sources": dashboard["torrent_sources_by_site"],
+        },
+        "local": {"titles": 2, "files": 3, "bytes": 300},
+        "gdrive": {"titles": 4, "files": 5, "bytes": 500},
+    }
     transfers = service.list_transfers(
         state="queued",
         target="gdrive",
@@ -250,6 +286,61 @@ def test_dashboard_and_transfer_queries_do_not_need_flask_or_postgres():
         "offset": 0,
     }
     assert transfers.as_dict()["items"][0]["state"] == "queued"
+
+
+def test_dashboard_domains_separate_origin_from_physical_presence_without_duplicates():
+    assert "t.site IN ('filecr','1337x')" in DASHBOARD_SQL
+    assert "JOIN source_torrents t ON t.id=f.torrent_id" in DASHBOARD_SQL
+    assert "d.drive_file_id" in DASHBOARD_SQL
+    assert "d.active AND d.can_download" in DASHBOARD_SQL
+    assert "SELECT DISTINCT f.id AS file_id" in DASHBOARD_SQL
+    assert "job.state='completed'" in DASHBOARD_SQL
+    assert "jsonb_array_length(job.local_files) > 0" in DASHBOARD_SQL
+    assert "source_torrent_count" in DASHBOARD_SQL
+    assert "source_file_count" in DASHBOARD_SQL
+    assert "source_bytes_total" in DASHBOARD_SQL
+    assert "gdrive_bytes_total" in DASHBOARD_SQL
+    assert "gdrive_title_count" in DASHBOARD_SQL
+    assert "local_bytes_total" in DASHBOARD_SQL
+    assert "local_title_count" in DASHBOARD_SQL
+    assert "torrent_sources_by_site" in DASHBOARD_SQL
+
+
+def test_dashboard_accepts_json_text_for_torrent_source_breakdown():
+    database = FakeDatabase(
+        {
+            "torrent_sources_by_site": (
+                '{"filecr":{"titles":1,"files":2,"bytes":3}}'
+            )
+        }
+    )
+
+    result = InventoryService(database).dashboard()
+
+    assert result["domains"]["torrent"]["sources"]["filecr"] == {
+        "titles": 1,
+        "files": 2,
+        "bytes": 3,
+    }
+    assert result["domains"]["local"] == {"titles": 0, "files": 0, "bytes": 0}
+
+
+def test_explorer_virtual_torrent_site_groups_real_torrent_sources_only():
+    database = FakeDatabase({"total_count": 0, "items": []})
+
+    InventoryService(database).explorer(site="torrent", page_size=10)
+
+    sql, params = database.calls[0]
+    assert params["site"] == "torrent"
+    assert "CAST(%(site)s AS text)='torrent'" in sql
+    assert "t.site IN ('filecr','1337x')" in sql
+
+
+def test_transfer_site_filter_does_not_accept_virtual_torrent_site():
+    service = InventoryService(FakeDatabase())
+
+    with pytest.raises(ValueError, match="site invalido"):
+        service.transfers(site="torrent")
 
 
 def test_public_transfer_query_redacts_internal_manifests_and_resume_url():
