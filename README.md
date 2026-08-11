@@ -15,6 +15,9 @@ fluxo persistente **torrent → pasta local → classificação → Google Drive
 - PostgreSQL como catálogo canônico e Redis apenas para sinais transitórios;
 - dashboard com cards separados e selecionáveis para Drive, FileCR, 1337x e
   Local, com status, localização, tipos e volume por fonte;
+- curadoria de TV/filmes/séries com prioridades fixas, ranking por
+  popularidade/perfil do Drive, exigência de legenda e publicação explícita em
+  `#Avideos/TV/...` ou `#Avideos/Movies/...`;
 - explorador por texto, fonte, tipo, status e presença local/Drive, com
   agrupamento e ações em lote por tipo;
 - classificação em vídeo, áudio, legenda, imagem, documento, compactado,
@@ -103,7 +106,18 @@ Requisitos:
    .\iniciar.bat
    ```
 
-O painel abrirá em <http://127.0.0.1:5090>.
+O inicializador padrão usa o **modo leve**: sobe os serviços em fases, reutiliza
+a imagem existente e mantém `catalog-sync` e `transcoder` desligados. O painel
+abrirá em <http://127.0.0.1:5090/#curation>. Isso evita que um simples start
+reconstrua a imagem e ligue sincronização pesada/FFmpeg ao mesmo tempo.
+
+Construção e modo completo são decisões explícitas:
+
+```powershell
+.\iniciar.bat -Build       # reconstrói a imagem e inicia em modo leve
+.\iniciar.bat -Full        # adiciona catalog-sync e transcoder
+.\iniciar.bat -Build -Full # primeira implantação completa
+```
 
 Para habilitar NVIDIA/NVENC explicitamente, use o override opcional depois de
 validar o runtime da GPU:
@@ -156,6 +170,28 @@ PostgreSQL, Redis e migração da stack nova e adie workers, playback e novos jo
 até a transferência antiga chegar a um estado terminal verificado.
 
 ## Usando o painel
+
+### Curadoria #Avideos
+
+A tela inicial trabalha somente com torrents de mídia do 1337x nas categorias
+TV e Movies; o FileCR é excluído porque o inventário atual é de software/jogos.
+Breaking Bad, Game of Thrones, Dexter e The Walking Dead aparecem sempre na
+faixa de prioridades, inclusive quando não existe release válida no inventário.
+
+O filtro padrão mostra somente candidatos com legenda separada pronta. A ação
+remove samples/trailers, não reenvia vídeos com correspondência SHA-256 exata no
+Drive e apresenta uma prévia antes de criar qualquer job. Legendas `.srt/.vtt`
+baixadas e validadas no SubtitleVault são anexadas em `Subtitles/`. A estrutura
+de destino é:
+
+- `#Avideos/TV/<Título>/Season XX/...`;
+- `#Avideos/Movies/<Título> (Ano)/...`.
+
+O ranking combina IMDb/swarm com os gêneros mais frequentes nas pastas atuais
+do Drive. É uma heurística baseada nos metadados disponíveis, não uma afirmação
+de equivalência editorial. Nenhum download é disparado ao abrir ou filtrar a
+tela; somente o botão **Revisar e publicar**, seguido da confirmação explícita,
+cria transferências.
 
 ### Biblioteca
 

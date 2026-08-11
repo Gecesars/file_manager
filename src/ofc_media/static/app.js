@@ -2,8 +2,8 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
 
 const state = {
-  view: "library",
-  pages: { catalog: 1, files: 1, transfers: 1 },
+  view: "curation",
+  pages: { curation: 1, catalog: 1, files: 1, transfers: 1 },
   session: null,
   sessionEpoch: 0,
   pollController: null,
@@ -11,6 +11,7 @@ const state = {
   transferTimer: null,
   transferRequest: 0,
   filesRequest: 0,
+  curationRequest: 0,
   hls: null,
   metrics: null,
   policyPaused: false,
@@ -217,7 +218,7 @@ function renderPagination(name, data, loadPage) {
 function resetPage(name) { state.pages[name] = 1; }
 
 function setView(view, updateHash = true) {
-  if (!["library", "files", "transfers"].includes(view)) view = "library";
+  if (!["curation", "library", "files", "transfers"].includes(view)) view = "curation";
   state.view = view;
   $$('[data-view]').forEach((section) => { section.hidden = section.dataset.view !== view; });
   $$('[data-view-button]').forEach((item) => {
@@ -229,6 +230,7 @@ function setView(view, updateHash = true) {
   if (updateHash && window.location.hash !== `#${view}`) history.pushState(null, "", `#${view}`);
   if (state.transferTimer) window.clearTimeout(state.transferTimer);
   state.transferTimer = null;
+  if (view === "curation") curation().catch(showError);
   if (view === "library") catalog().catch(showError);
   if (view === "files") files().catch(showError);
   if (view === "transfers") transfers().catch(showError);
@@ -502,6 +504,162 @@ function openFilesDomain(domain) {
   setView("files");
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   window.requestAnimationFrame(() => $("#panel-files").scrollIntoView({ behavior: reducedMotion ? "auto" : "smooth", block: "start" }));
+}
+
+function curationStatus(value) {
+  return ({
+    ready: "Pronto para publicar",
+    found: "Encontrado, legenda pendente",
+    missing: "Não localizado no inventário",
+  })[value] || "Em análise";
+}
+
+function renderCurationPriorities(items) {
+  const target = $("[data-curation-priorities]");
+  target.replaceChildren();
+  items.forEach((item) => {
+    const card = document.createElement("article");
+    card.className = `priority-card ${item.status}`;
+    const rank = document.createElement("span");
+    rank.className = "priority-rank";
+    rank.textContent = `#${item.rank}`;
+    const copy = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = item.title;
+    const status = document.createElement("small");
+    status.textContent = `${curationStatus(item.status)} · ${formatNumber(item.candidate_count)} candidato(s)`;
+    copy.append(title, status);
+    card.append(rank, copy);
+    if (item.best_candidate) {
+      const inspect = button("Ver", "priority-action", async () => {
+        $("[data-curation-query]").value = item.title;
+        resetPage("curation");
+        await curation();
+      });
+      card.append(inspect);
+    }
+    target.append(card);
+  });
+}
+
+function curationAvailability(item) {
+  return ({
+    torrent: "Somente no torrent",
+    local: "Disponível localmente",
+    drive: "Já validado no Drive",
+    partial: "Disponibilidade parcial",
+  })[item.availability] || "Localização desconhecida";
+}
+
+async function publishCurated(item) {
+  const preview = await api(`/api/curation/media/${encodeURIComponent(item.site)}/${encodeURIComponent(item.infohash)}/preview`);
+  const subtitleCount = Number(preview.embedded_subtitle_count || 0) + Number(preview.external_subtitle_count || 0);
+  const warning = [
+    `Publicar “${preview.title}”?`,
+    `Destino: ${preview.drive_path}`,
+    `${preview.video_count} vídeo(s), ${subtitleCount} legenda(s), ${bytes(preview.bytes_total)}.`,
+    "O download só começará após esta confirmação e poderá consumir espaço e banda.",
+  ].join("\n\n");
+  if (!window.confirm(warning)) return;
+  if (preview.large_confirmation_required && !window.confirm(
+    `Transferência grande (${bytes(preview.bytes_total)}). Confirma novamente o download e o envio ao Drive?`,
+  )) return;
+  const result = await api(
+    `/api/curation/media/${encodeURIComponent(item.site)}/${encodeURIComponent(item.infohash)}/publish`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        confirm: true,
+        confirm_large: Boolean(preview.large_confirmation_required),
+      }),
+    },
+  );
+  toast(`${formatNumber(result.jobs?.length || 0)} job(s) criado(s) para ${result.drive_path}.`);
+  setView("transfers");
+  $("#tab-transfers")?.focus();
+}
+
+function renderCurationItem(item) {
+  const card = document.createElement("article");
+  card.className = `curation-card ${item.actionable ? "actionable" : "blocked"}`;
+  const head = document.createElement("div");
+  head.className = "curation-card-head";
+  const badges = document.createElement("div");
+  badges.className = "curation-badges";
+  const kind = document.createElement("span");
+  kind.className = "kind-badge";
+  kind.textContent = item.media_kind === "tv" ? "TV / Série" : "Filme";
+  const source = document.createElement("span");
+  source.className = "source-badge 1337x";
+  source.textContent = "1337x";
+  badges.append(kind, source);
+  const score = document.createElement("strong");
+  score.className = "curation-score";
+  score.textContent = `Score ${Number(item.popularity_score || 0).toLocaleString("pt-BR", { maximumFractionDigits: 1 })}`;
+  head.append(badges, score);
+  const title = document.createElement("h3");
+  title.textContent = item.display_title || item.canonical_title || item.title;
+  const release = document.createElement("p");
+  release.className = "curation-release";
+  release.textContent = `${item.release_year || "Ano não informado"} · ★ ${item.imdb_rating ?? "—"} · ${formatNumber(item.seeders)} seeds`;
+  const recommendation = document.createElement("p");
+  recommendation.className = "curation-recommendation";
+  recommendation.textContent = item.recommendation_reason || "Popularidade no catálogo";
+  const metrics = document.createElement("div");
+  metrics.className = "curation-metrics";
+  metrics.append(
+    torrentMetric("Vídeos", formatNumber(item.video_count)),
+    torrentMetric("Volume", bytes(item.video_bytes)),
+    torrentMetric("Legendas", item.subtitles_ready ? `${formatNumber(item.subtitle_count)} pronta(s)` : "Pendente"),
+  );
+  const location = document.createElement("p");
+  location.className = "curation-location";
+  location.textContent = curationAvailability(item);
+  const destination = document.createElement("code");
+  destination.className = "curation-destination";
+  destination.textContent = `#Avideos/${item.destination_path}`;
+  const note = document.createElement("p");
+  note.className = `curation-note ${item.subtitles_ready ? "ready" : "warning"}`;
+  note.textContent = item.subtitles_ready
+    ? `${formatNumber(item.embedded_subtitle_count)} no torrent · ${formatNumber(item.external_subtitle_count)} externa(s) validada(s)`
+    : "Ação bloqueada até existir uma legenda separada e validada.";
+  const actions = document.createElement("div");
+  actions.className = "curation-actions";
+  const inspect = button("Explorar torrent", "secondary", () => {
+    openFilesDomain("1337x");
+    $("[data-files-query]").value = item.infohash;
+    return files();
+  });
+  const publish = button(
+    item.availability === "drive" ? "Já está no Drive" : item.subtitles_ready ? "Revisar e publicar" : "Aguardando legenda",
+    "primary",
+    () => publishCurated(item),
+  );
+  publish.disabled = !item.actionable;
+  actions.append(inspect, publish);
+  card.append(head, title, release, recommendation, metrics, location, destination, note, actions);
+  return card;
+}
+
+async function curation() {
+  const epoch = ++state.curationRequest;
+  const params = new URLSearchParams({
+    q: $("[data-curation-query]").value,
+    media_kind: $("[data-curation-kind]").value,
+    subtitles: $("[data-curation-subtitles]").value,
+    availability: $("[data-curation-availability]").value,
+    page: String(state.pages.curation),
+    per_page: "24",
+  });
+  const data = await api(`/api/curation/media?${params}`);
+  if (epoch !== state.curationRequest) return;
+  renderCurationPriorities(Array.isArray(data.priorities) ? data.priorities : []);
+  $("[data-curation-total]").textContent = `${formatNumber(data.total)} candidato(s) de mídia`;
+  const grid = $("[data-curation-grid]");
+  grid.replaceChildren();
+  (data.items || []).forEach((item) => grid.append(renderCurationItem(item)));
+  $("[data-curation-empty]").hidden = Boolean(data.items?.length);
+  renderPagination("curation", data, curation);
 }
 
 async function categories() {
@@ -1689,6 +1847,7 @@ $$('[data-view-button]').forEach((item, index, tabs) => {
 });
 $("[data-health]").onclick = () => health();
 $("[data-sync-drive]").onclick = syncDrive;
+$("[data-open-curation]").onclick = () => setView("curation");
 $("[data-open-all]").onclick = () => openFilesDomain("all");
 $("[data-open-transfers]").onclick = () => setView("transfers");
 $$('[data-select-source]').forEach((item) => { item.onclick = () => selectSource(item.dataset.selectSource, true); });
@@ -1703,6 +1862,13 @@ $("[data-catalog-site]").onchange = async () => {
 };
 $("[data-category]").onchange = () => { resetPage("catalog"); catalog().catch(showError); };
 $("[data-sort]").onchange = () => { resetPage("catalog"); catalog().catch(showError); };
+$("[data-curation-search]").onclick = () => { resetPage("curation"); curation().catch(showError); };
+$("[data-curation-query]").onkeydown = (event) => {
+  if (event.key === "Enter") { resetPage("curation"); curation().catch(showError); }
+};
+$("[data-curation-kind]").onchange = () => { resetPage("curation"); curation().catch(showError); };
+$("[data-curation-subtitles]").onchange = () => { resetPage("curation"); curation().catch(showError); };
+$("[data-curation-availability]").onchange = () => { resetPage("curation"); curation().catch(showError); };
 $("[data-files-search]").onclick = () => { resetPage("files"); files().catch(showError); };
 $("[data-files-query]").onkeydown = (event) => {
   if (event.key === "Enter") { resetPage("files"); files().catch(showError); }
@@ -1767,7 +1933,7 @@ window.addEventListener("beforeunload", () => {
 });
 function syncViewFromLocation() {
   const requested = window.location.hash.replace("#", "");
-  const selected = ["library", "files", "transfers"].includes(requested) ? requested : "library";
+  const selected = ["curation", "library", "files", "transfers"].includes(requested) ? requested : "curation";
   if (state.view !== selected) setView(selected, false);
 }
 
@@ -1776,7 +1942,7 @@ window.addEventListener("popstate", syncViewFromLocation);
 
 const initialView = window.location.hash.replace("#", "");
 setView(initialView, false);
-if (!["library", "files", "transfers"].includes(initialView)) history.replaceState(null, "", "#library");
+if (!["curation", "library", "files", "transfers"].includes(initialView)) history.replaceState(null, "", "#curation");
 health();
 dashboard();
 categories().catch(showError);

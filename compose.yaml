@@ -149,9 +149,12 @@ services:
       OFC_GDRIVE_ROOT_ID: ${OFC_GDRIVE_ROOT_ID}
       OFC_GDRIVE_TOKEN_PATH: /run/secrets/gdrive/token.json
       OFC_GDRIVE_SYNC_INTERVAL: ${OFC_GDRIVE_SYNC_INTERVAL:-300}
+      SUBTITLE_FILE_ROOT: /subtitle-files
+      SUBTITLE_HOST_ROOT: D:/dev/Torrents/SubtitleVault/subtitles
     volumes:
       - D:/dev/Avideos/token.json:/run/secrets/gdrive/token.json:ro
       - ./storage/media:/media
+      - D:/dev/Torrents/SubtitleVault/subtitles:/subtitle-files:ro
     depends_on:
       migrate:
         condition: service_completed_successfully

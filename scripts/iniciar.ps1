@@ -1,3 +1,8 @@
+param(
+    [switch]$Build,
+    [switch]$Full
+)
+
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath (Split-Path -Parent $PSScriptRoot)
 
@@ -41,18 +46,70 @@ if (-not (Test-DockerReady)) {
 
 docker compose config --quiet
 if ($LASTEXITCODE -ne 0) { throw 'compose.yaml invalido.' }
-docker compose up -d --build
-if ($LASTEXITCODE -ne 0) { throw 'A stack nao iniciou.' }
 
-$deadline = [DateTime]::UtcNow.AddMinutes(8)
-do {
-    Start-Sleep -Seconds 5
-    $status = docker compose ps --format json | ConvertFrom-Json
-    $gateway = @($status | Where-Object { $_.Service -eq 'gateway' -and $_.Health -eq 'healthy' })
-} while (-not $gateway -and [DateTime]::UtcNow -lt $deadline)
+$imageReady = $false
+$oldPreference = $ErrorActionPreference
+$ErrorActionPreference = 'SilentlyContinue'
+try {
+    docker image inspect file-manager:2.0.0 *> $null
+    $imageReady = $LASTEXITCODE -eq 0
+} finally {
+    $ErrorActionPreference = $oldPreference
+}
+if ($Build -or -not $imageReady) {
+    Write-Host 'Construindo a imagem uma unica vez. Os proximos inicios reutilizarao esta imagem.' -ForegroundColor Yellow
+    docker compose build control
+    if ($LASTEXITCODE -ne 0) { throw 'A imagem da aplicacao nao foi construida.' }
+}
+
+function Start-ServicePhase([string[]]$Services) {
+    docker compose up -d --no-build --no-deps @Services
+    if ($LASTEXITCODE -ne 0) {
+        throw "Falha ao iniciar: $($Services -join ', ')."
+    }
+}
+
+function Wait-ServiceHealth([string]$Service, [int]$Seconds = 90) {
+    $deadline = [DateTime]::UtcNow.AddSeconds($Seconds)
+    do {
+        $row = @(docker compose ps --format json $Service | ConvertFrom-Json)
+        $healthy = @($row | Where-Object {
+            $_.Service -eq $Service -and ($_.Health -eq 'healthy' -or (-not $_.Health -and $_.State -eq 'running'))
+        })
+        if ($healthy) { return }
+        Start-Sleep -Seconds 3
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "$Service nao ficou saudavel dentro do limite."
+}
+
+# Inicio em fases: evita o pico simultaneo de PostgreSQL, catalogo, FFmpeg e
+# libtorrent. O modo padrao serve curadoria/Drive com menos de 1 GiB observado.
+Start-ServicePhase @('postgres')
+Wait-ServiceHealth 'postgres' 60
+Start-ServicePhase @('redis')
+Wait-ServiceHealth 'redis' 60
+
+docker compose run --rm migrate
+if ($LASTEXITCODE -ne 0) { throw 'A migracao do banco falhou.' }
+
+Start-ServicePhase @('torrent-engine', 'gdrive-source')
+Wait-ServiceHealth 'torrent-engine' 90
+Wait-ServiceHealth 'gdrive-source' 90
+Start-ServicePhase @('control')
+Wait-ServiceHealth 'control' 90
+Start-ServicePhase @('gateway')
+Wait-ServiceHealth 'gateway' 60
+
+if ($Full) {
+    Write-Host 'Modo completo solicitado: iniciando transcodificacao e sincronizacao do catalogo.' -ForegroundColor Yellow
+    Start-ServicePhase @('transcoder')
+    Wait-ServiceHealth 'transcoder' 90
+    Start-ServicePhase @('catalog-sync')
+} else {
+    Write-Host 'Modo leve: catalog-sync e transcoder permanecem desligados.' -ForegroundColor Cyan
+}
 
 docker compose ps
-if (-not $gateway) { throw 'Gateway nao ficou saudavel; consulte docker compose logs.' }
 $portLine = Get-Content -LiteralPath '.env' | Where-Object { $_ -match '^OFC_PUBLIC_PORT=' } | Select-Object -First 1
 $port = if ($portLine) { $portLine.Split('=', 2)[1] } else { '5090' }
 Write-Host "File Manager: http://127.0.0.1:$port" -ForegroundColor Green

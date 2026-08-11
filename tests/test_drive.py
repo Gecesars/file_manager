@@ -984,6 +984,57 @@ def test_worker_claims_downloaded_upload_job_and_publishes_manifest(tmp_path: Pa
     assert store.sha256s == [(41, hashlib.sha256(b"episode").hexdigest())]
 
 
+def test_upload_worker_includes_external_subtitle_from_read_only_vault(tmp_path: Path):
+    media_root = tmp_path / "media"
+    subtitle_root = tmp_path / "subtitle-vault"
+    media_root.mkdir()
+    subtitle_root.mkdir()
+    episode = media_root / "episode.mkv"
+    subtitle = subtitle_root / "episode.pt-BR.srt"
+    episode.write_bytes(b"episode")
+    subtitle.write_bytes(b"subtitle")
+    settings = SimpleNamespace(
+        gdrive_root_id="root-folder-12345",
+        media_root=media_root,
+        resume_root=tmp_path / "resume",
+        subtitle_file_root=subtitle_root,
+    )
+    job = {
+        "id": "job-curation-upload",
+        "source_site": "1337x",
+        "infohash": "a" * 40,
+        "target": "gdrive",
+        "state": "downloaded",
+        "destination_path": "TV/Dexter/Season 01",
+        "local_files": [
+            {"file_id": 41, "local_path": str(episode), "relative_path": "episode.mkv"}
+        ],
+        "external_files": [
+            {
+                "external_id": "subtitle-track",
+                "local_path": str(subtitle),
+                "relative_path": "Subtitles/episode.pt-BR.srt",
+            }
+        ],
+        "drive_files": [],
+        "upload_state": {},
+    }
+    store = FakeStore(upload=job)
+    client = FakeTransferClient()
+
+    worker = DriveTransferWorker(settings, client, store=store)
+    assert worker.run_once("gdrive")["state"] == "completed"
+
+    final = next(
+        update for _, update in reversed(store.updates) if update.get("state") == "completed"
+    )
+    assert {entry["relative_path"] for entry in final["drive_files"]} == {
+        "episode.mkv",
+        "Subtitles/episode.pt-BR.srt",
+    }
+    assert final["bytes_done"] == len(b"episode") + len(b"subtitle")
+
+
 def test_torrent_upload_keeps_classified_root_once_and_original_subtree(
     tmp_path: Path,
 ):

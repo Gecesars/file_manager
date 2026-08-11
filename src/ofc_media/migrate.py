@@ -472,6 +472,8 @@ CREATE TABLE IF NOT EXISTS runtime.transfer_jobs(
         CHECK (bytes_done >= 0 AND bytes_done <= bytes_total),
     local_files JSONB NOT NULL DEFAULT '[]'::jsonb
         CHECK (jsonb_typeof(local_files)='array'),
+    external_files JSONB NOT NULL DEFAULT '[]'::jsonb
+        CHECK (jsonb_typeof(external_files)='array'),
     drive_files JSONB NOT NULL DEFAULT '[]'::jsonb
         CHECK (jsonb_typeof(drive_files)='array'),
     upload_state JSONB NOT NULL DEFAULT '{}'::jsonb
@@ -492,6 +494,24 @@ CREATE INDEX IF NOT EXISTS transfer_jobs_source
     ON runtime.transfer_jobs(source_site, infohash, created_at DESC);
 CREATE INDEX IF NOT EXISTS transfer_jobs_selected_files
     ON runtime.transfer_jobs USING gin(selected_file_ids);
+
+-- A curadoria pode anexar legendas ja validadas no SubtitleVault ao mesmo
+-- upload, sem mistura-las ao inventario imutavel do torrent.
+ALTER TABLE runtime.transfer_jobs
+    ADD COLUMN IF NOT EXISTS external_files JSONB NOT NULL DEFAULT '[]'::jsonb;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid='runtime.transfer_jobs'::regclass
+          AND conname='transfer_jobs_external_files_check'
+    ) THEN
+        ALTER TABLE runtime.transfer_jobs
+            ADD CONSTRAINT transfer_jobs_external_files_check
+            CHECK (jsonb_typeof(external_files)='array');
+    END IF;
+END
+$$;
 
 CREATE OR REPLACE FUNCTION runtime.guard_transfer_job_state()
 RETURNS trigger
@@ -583,6 +603,9 @@ ON CONFLICT(version) DO NOTHING;
 INSERT INTO ops.schema_migrations(version, description)
 VALUES (3, 'inventario canonico e transferencias locais/Google Drive')
 ON CONFLICT(version) DO NOTHING;
+INSERT INTO ops.schema_migrations(version, description)
+VALUES (4, 'curadoria de midia e legendas externas validadas')
+ON CONFLICT(version) DO NOTHING;
 """
 
 
@@ -590,7 +613,7 @@ def migrate(settings: Settings | None = None) -> None:
     selected = settings or Settings.from_env()
     with psycopg.connect(selected.database_url, autocommit=True) as database:
         database.execute(SCHEMA_SQL)
-    LOG.info("schema v3 aplicado")
+    LOG.info("schema v4 aplicado")
 
 
 def main() -> None:

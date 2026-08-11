@@ -365,6 +365,53 @@ def test_large_transfer_requires_explicit_confirmation(
     )
 
 
+def test_curated_transfer_uses_classified_override_and_validated_external_subtitle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    subtitle_root = tmp_path / "subtitles"
+    subtitle_root.mkdir()
+    subtitle = subtitle_root / "episode.pt-BR.srt"
+    subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\nOi\n", encoding="utf-8")
+    database = TransferDatabase(
+        [
+            {
+                "id": 4,
+                "path": "Release/S01E01.mkv",
+                "file_kind": "video",
+                "mime_type": "video/x-matroska",
+                "size": 123,
+            }
+        ]
+    )
+    install_connection(monkeypatch, database)
+    monkeypatch.setattr(control.requests, "post", lambda *_args, **_kwargs: OkResponse())
+
+    result = bare_plane(
+        torrent_engine_url="http://torrent", subtitle_file_root=subtitle_root
+    ).create_transfer(
+        site="1337x",
+        infohash=INFOHASH,
+        target="gdrive",
+        file_ids=[4],
+        destination_override="TV/Dexter/Season 01",
+        external_files=[
+            {
+                "external_id": "track-1",
+                "local_path": str(subtitle),
+                "relative_path": "Subtitles/episode.pt-BR.srt",
+            }
+        ],
+    )
+
+    assert result["destination_path"] == "TV/Dexter/Season 01"
+    assert result["external_file_count"] == 1
+    insert_params = next(
+        params for sql, params in database.calls if "INSERT INTO runtime.transfer_jobs" in sql
+    )
+    assert insert_params[-2].obj[0]["relative_path"] == "Subtitles/episode.pt-BR.srt"
+    assert Path(insert_params[-2].obj[0]["local_path"]) == subtitle.resolve()
+
+
 def test_playback_selection_requires_active_downloadable_drive_file(
     monkeypatch: pytest.MonkeyPatch,
 ):

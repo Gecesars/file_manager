@@ -1903,7 +1903,11 @@ class DriveTransferWorker:
         self.settings = settings
         self.client = client
         self.store = store or PostgresTransferStore(settings)
-        roots = allowed_local_roots or (settings.media_root, settings.resume_root)
+        configured_subtitles = getattr(settings, "subtitle_file_root", None)
+        default_roots = [settings.media_root, settings.resume_root]
+        if configured_subtitles is not None:
+            default_roots.append(Path(configured_subtitles))
+        roots = allowed_local_roots or tuple(default_roots)
         self.allowed_local_roots = tuple(Path(root).resolve() for root in roots)
 
     def _source_path(self, item: Mapping[str, Any]) -> Path:
@@ -2079,9 +2083,12 @@ class DriveTransferWorker:
             return verified
         if job_state not in {"classifying", "uploading"}:
             raise RuntimeError(f"job gdrive nao retomavel no estado {job_state}")
-        local_items = _manifest_items(job.get("local_files"))
+        local_items = [
+            *_manifest_items(job.get("local_files")),
+            *_manifest_items(job.get("external_files")),
+        ]
         if not local_items:
-            raise RuntimeError("job gdrive nao possui local_files")
+            raise RuntimeError("job gdrive nao possui arquivos locais")
         raw_sources = [(item, self._source_path(item)) for item in local_items]
         source_paths = [str(source).casefold() for _, source in raw_sources]
         if len(source_paths) != len(set(source_paths)):

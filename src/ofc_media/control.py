@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 import math
+import mimetypes
 import re
 import secrets
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Mapping
 
 import requests
@@ -17,6 +19,7 @@ from . import __version__
 from .auth import token_digest, token_matches
 from .buffering import DynamicBufferController
 from .config import Settings
+from .curation import CurationService
 from .db import connection
 from .file_kinds import FILE_KINDS, safe_destination_path
 from .heartbeat import start_heartbeat
@@ -359,6 +362,8 @@ class ControlPlane:
         target: str,
         file_ids: Any,
         confirm_large: bool = False,
+        destination_override: str | None = None,
+        external_files: Any = None,
     ) -> dict[str, Any]:
         selected_site = site.strip().casefold()
         selected_target = target.strip().casefold()
@@ -416,10 +421,51 @@ class ControlPlane:
                 or torrent.get("display_name")
                 or selected_infohash
             )
-            destination_path = safe_destination_path(
-                destination_kind, category, title
+            destination_path = (
+                safe_destination_path(str(destination_override))
+                if destination_override
+                else safe_destination_path(destination_kind, category, title)
             )
-            bytes_total = sum(int(row.get("size") or 0) for row in files)
+            selected_external: list[dict[str, Any]] = []
+            if external_files is not None:
+                if not isinstance(external_files, list) or len(external_files) > MAX_TRANSFER_FILES:
+                    raise ValueError("external_files excede o limite permitido")
+                subtitle_root = self.settings.subtitle_file_root.resolve(strict=True)
+                seen_paths: set[str] = set()
+                seen_names: set[str] = set()
+                for value in external_files:
+                    if not isinstance(value, Mapping):
+                        raise UnsafeMediaError("manifesto de legenda externa invalido")
+                    source = Path(str(value.get("local_path") or "")).resolve(strict=True)
+                    try:
+                        source.relative_to(subtitle_root)
+                    except ValueError as exc:
+                        raise UnsafeMediaError("legenda externa fora do cofre") from exc
+                    if not source.is_file():
+                        raise UnsafeMediaError("legenda externa indisponivel")
+                    relative = safe_destination_path(str(value.get("relative_path") or source.name))
+                    source_key = str(source).casefold()
+                    relative_key = relative.casefold()
+                    if source_key in seen_paths or relative_key in seen_names:
+                        raise UnsafeMediaError("legenda externa duplicada no manifesto")
+                    seen_paths.add(source_key)
+                    seen_names.add(relative_key)
+                    selected_external.append(
+                        {
+                            "external_id": str(value.get("external_id") or ""),
+                            "local_path": str(source),
+                            "relative_path": relative,
+                            "size": source.stat().st_size,
+                            "mime_type": str(
+                                value.get("mime_type")
+                                or mimetypes.guess_type(source.name)[0]
+                                or "application/octet-stream"
+                            ),
+                        }
+                    )
+            bytes_total = sum(int(row.get("size") or 0) for row in files) + sum(
+                int(row["size"]) for row in selected_external
+            )
             if bytes_total >= LARGE_TRANSFER_BYTES and confirm_large is not True:
                 raise LargeTransferConfirmationRequired(bytes_total)
             drive_files: list[dict[str, Any]] = []
@@ -455,6 +501,10 @@ class ControlPlane:
                     selected_infohash,
                     selected_target,
                     ",".join(str(file_id) for file_id in selected_ids),
+                    ",".join(
+                        str(value.get("external_id") or value["relative_path"])
+                        for value in selected_external
+                    ),
                 )
             )
             database.execute(
@@ -469,6 +519,7 @@ class ControlPlane:
                 FROM runtime.transfer_jobs
                 WHERE source_site=%s AND infohash=%s AND target=%s
                   AND selected_file_ids=%s::bigint[] AND destination_path=%s
+                  AND external_files=%s::jsonb
                   AND state NOT IN ('failed','cancelled')
                   AND (state <> 'completed'
                        OR finished_at > now() - interval '5 minutes')
@@ -480,6 +531,7 @@ class ControlPlane:
                     selected_target,
                     selected_ids,
                     destination_path,
+                    Jsonb(selected_external),
                 ),
             ).fetchone()
             if existing is not None:
@@ -492,8 +544,8 @@ class ControlPlane:
                 """
                 INSERT INTO runtime.transfer_jobs(
                   id,source_site,infohash,target,state,selected_file_ids,
-                  destination_path,bytes_total,bytes_done,drive_files)
-                VALUES(%s,%s,%s,%s,'queued',%s,%s,%s,0,%s)
+                  destination_path,bytes_total,bytes_done,external_files,drive_files)
+                VALUES(%s,%s,%s,%s,'queued',%s,%s,%s,0,%s,%s)
                 """,
                 (
                     job_id,
@@ -503,6 +555,7 @@ class ControlPlane:
                     selected_ids,
                     destination_path,
                     bytes_total,
+                    Jsonb(selected_external),
                     Jsonb(drive_files),
                 ),
             )
@@ -519,6 +572,7 @@ class ControlPlane:
                     "file_ids": selected_ids,
                     "destination_path": destination_path,
                     "bytes_total": bytes_total,
+                    "external_file_count": len(selected_external),
                 },
             )
             database.commit()
@@ -530,6 +584,7 @@ class ControlPlane:
             "target": selected_target,
             "state": "queued",
             "file_count": len(selected_ids),
+            "external_file_count": len(selected_external),
             "destination_path": destination_path,
             "bytes_total": bytes_total,
             "bytes_done": 0,
@@ -583,6 +638,135 @@ class ControlPlane:
                 LOG.exception("falha ao persistir erro do job %s", job_id)
             raise RuntimeError("nao foi possivel iniciar a transferencia") from exc
         return result
+
+    def curation_media(
+        self,
+        *,
+        query: str | None,
+        media_kind: str | None,
+        subtitles: str | None,
+        availability: str | None,
+        page: int | str,
+        per_page: int | str,
+    ) -> dict[str, Any]:
+        with connection(self.settings) as database:
+            selected = CurationService(database).list_media(
+                query=query,
+                media_kind=media_kind,
+                subtitles=subtitles,
+                availability=availability,
+                page=page,
+                page_size=per_page,
+            )
+        return selected.as_dict()
+
+    def _curation_plan(self, site: str, infohash: str) -> dict[str, Any]:
+        with connection(self.settings) as database:
+            plan = CurationService(database).publication_plan(site, infohash)
+        external_manifest: list[dict[str, Any]] = []
+        for subtitle in plan["external_subtitles"]:
+            stored = str(subtitle.get("synced_path") or subtitle.get("subtitle_path") or "")
+            selected = resolve_subtitle_path(
+                stored,
+                mounted_root=self.settings.subtitle_file_root,
+                host_root=self.settings.subtitle_host_root,
+            )
+            identity = subtitle_track_id(
+                plan["site"],
+                plan["infohash"],
+                str(subtitle.get("torrent_path") or ""),
+                str(subtitle.get("language") or ""),
+            )
+            language = re.sub(
+                r"[^A-Za-z0-9-]+", "-", str(subtitle.get("language") or "und")
+            ).strip("-") or "und"
+            name = f"{selected.stem}.{language}.{identity[:8]}{selected.suffix.casefold()}"
+            external_manifest.append(
+                {
+                    "external_id": identity,
+                    "local_path": str(selected),
+                    "relative_path": safe_destination_path("Subtitles", name),
+                    "size": selected.stat().st_size,
+                    "mime_type": mimetypes.guess_type(selected.name)[0]
+                    or "application/octet-stream",
+                }
+            )
+        if len(external_manifest) > MAX_TRANSFER_FILES:
+            raise ValueError(
+                f"titulo possui mais de {MAX_TRANSFER_FILES} legendas externas; refine por temporada"
+            )
+        plan["external_manifest"] = external_manifest
+        plan["bytes_total"] = int(plan.get("bytes_total") or 0) + sum(
+            int(value["size"]) for value in external_manifest
+        )
+        return plan
+
+    def curation_preview(self, site: str, infohash: str) -> dict[str, Any]:
+        plan = self._curation_plan(site, infohash)
+        return {
+            "site": plan["site"],
+            "infohash": plan["infohash"],
+            "title": plan["title"],
+            "media_kind": plan["media_kind"],
+            "destination_path": plan["destination_path"],
+            "drive_path": f"#Avideos/{plan['destination_path']}",
+            "video_count": len(plan["video_files"]),
+            "embedded_subtitle_count": len(plan["embedded_subtitle_files"]),
+            "external_subtitle_count": len(plan["external_manifest"]),
+            "bytes_total": plan["bytes_total"],
+            "confirmation_required": True,
+            "large_confirmation_required": plan["bytes_total"] >= LARGE_TRANSFER_BYTES,
+            "automatic_download": False,
+        }
+
+    def publish_curation(
+        self,
+        *,
+        site: str,
+        infohash: str,
+        confirmed: bool,
+        confirm_large: bool,
+    ) -> dict[str, Any]:
+        if confirmed is not True:
+            raise ValueError("a publicacao exige confirmacao explicita")
+        plan = self._curation_plan(site, infohash)
+        if plan["bytes_total"] >= LARGE_TRANSFER_BYTES and confirm_large is not True:
+            raise LargeTransferConfirmationRequired(plan["bytes_total"])
+
+        groups: list[tuple[list[int], list[dict[str, Any]]]] = []
+        video_ids = [int(value["id"]) for value in plan["video_files"]]
+        subtitle_ids = [int(value["id"]) for value in plan["embedded_subtitle_files"]]
+        for start in range(0, len(video_ids), MAX_TRANSFER_FILES):
+            groups.append((video_ids[start : start + MAX_TRANSFER_FILES], []))
+        for start in range(0, len(subtitle_ids), MAX_TRANSFER_FILES):
+            groups.append((subtitle_ids[start : start + MAX_TRANSFER_FILES], []))
+        if not groups:
+            raise ValueError("nenhum arquivo elegivel para publicar")
+        groups[0] = (groups[0][0], list(plan["external_manifest"]))
+
+        jobs: list[dict[str, Any]] = []
+        for file_ids, external in groups:
+            jobs.append(
+                self.create_transfer(
+                    site=plan["site"],
+                    infohash=plan["infohash"],
+                    target="gdrive",
+                    file_ids=file_ids,
+                    confirm_large=confirm_large,
+                    destination_override=plan["destination_path"],
+                    external_files=external,
+                )
+            )
+        return {
+            "accepted": True,
+            "site": plan["site"],
+            "infohash": plan["infohash"],
+            "title": plan["title"],
+            "destination_path": plan["destination_path"],
+            "drive_path": f"#Avideos/{plan['destination_path']}",
+            "bytes_total": plan["bytes_total"],
+            "jobs": jobs,
+        }
 
     def sync_drive(self) -> dict[str, Any]:
         correlation_id = uuid.uuid4()
@@ -1039,6 +1223,63 @@ def create_app() -> Flask:
     @app.get("/api/dashboard")
     def dashboard() -> Response:
         return jsonify(plane.dashboard())
+
+    @app.get("/api/curation/media")
+    def curation_media() -> Response:
+        try:
+            result = plane.curation_media(
+                query=request.args.get("q"),
+                media_kind=request.args.get("media_kind"),
+                subtitles=request.args.get("subtitles"),
+                availability=request.args.get("availability"),
+                page=request.args.get("page", "1"),
+                per_page=request.args.get("per_page", "24"),
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(result)
+
+    @app.get("/api/curation/media/<site>/<infohash>/preview")
+    def curation_preview(site: str, infohash: str) -> Response:
+        try:
+            result = plane.curation_preview(site, normalized_infohash(infohash))
+        except KeyError:
+            return jsonify({"error": "titulo ausente"}), 404
+        except (ValueError, UnsafeMediaError, OSError) as exc:
+            return jsonify({"error": str(exc)}), 422
+        return jsonify(result)
+
+    @app.post("/api/curation/media/<site>/<infohash>/publish")
+    def curation_publish(site: str, infohash: str) -> Response:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, Mapping):
+            payload = {}
+        try:
+            result = plane.publish_curation(
+                site=site,
+                infohash=normalized_infohash(infohash),
+                confirmed=payload.get("confirm") is True,
+                confirm_large=payload.get("confirm_large") is True,
+            )
+        except KeyError:
+            return jsonify({"error": "titulo ausente"}), 404
+        except LargeTransferConfirmationRequired as exc:
+            return (
+                jsonify(
+                    {
+                        "error": str(exc),
+                        "confirmation_required": True,
+                        "bytes_total": exc.bytes_total,
+                        "threshold_bytes": LARGE_TRANSFER_BYTES,
+                    }
+                ),
+                409,
+            )
+        except (ValueError, UnsafeMediaError, OSError) as exc:
+            return jsonify({"error": str(exc)}), 422
+        except RuntimeError as exc:
+            return jsonify({"error": str(exc)}), 502
+        return jsonify(result), 201
 
     @app.get("/api/files")
     def files() -> Response:

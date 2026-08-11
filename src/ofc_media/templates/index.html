@@ -9,12 +9,13 @@
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="#library" aria-label="File Manager">
+    <a class="brand" href="#curation" aria-label="File Manager">
       <span class="brand-mark">FM</span>
       <span><strong>File Manager</strong><small>Drive · Local · Torrents</small></span>
     </a>
     <nav class="tabs" aria-label="Áreas do painel" role="tablist">
-      <button class="tab active" id="tab-library" data-view-button="library" type="button" role="tab" aria-selected="true" aria-controls="panel-library">Biblioteca</button>
+      <button class="tab active" id="tab-curation" data-view-button="curation" type="button" role="tab" aria-selected="true" aria-controls="panel-curation">Curadoria</button>
+      <button class="tab" id="tab-library" data-view-button="library" type="button" role="tab" aria-selected="false" aria-controls="panel-library" tabindex="-1">Biblioteca</button>
       <button class="tab" id="tab-files" data-view-button="files" type="button" role="tab" aria-selected="false" aria-controls="panel-files" tabindex="-1">Arquivos</button>
       <button class="tab" id="tab-transfers" data-view-button="transfers" type="button" role="tab" aria-selected="false" aria-controls="panel-transfers" tabindex="-1">Transferências</button>
     </nav>
@@ -29,6 +30,7 @@
         <p>Escolha uma fonte, filtre por tipo e acompanhe com clareza o que está no Google Drive, na área local ou nos inventários FileCR e 1337x.</p>
       </div>
       <div class="hero-actions">
+        <button class="primary hero-action" data-open-curation type="button">Curadoria #Avideos</button>
         <button class="primary hero-action" data-open-all type="button">Explorar tudo</button>
         <button class="secondary hero-action" data-open-transfers type="button">Ver transferências</button>
       </div>
@@ -162,7 +164,34 @@
       <article><span>Em andamento</span><strong data-stat="active">—</strong><small>downloads e uploads</small></article>
     </section>
 
-    <section class="workspace" id="panel-library" data-view="library" role="tabpanel" aria-labelledby="tab-library">
+    <section class="workspace curation-workspace" id="panel-curation" data-view="curation" role="tabpanel" aria-labelledby="tab-curation">
+      <div class="section-head">
+        <div><span class="eyebrow">Ação controlada · Google Drive</span><h2>Curadoria para #Avideos</h2><p class="section-context">Somente TV, filmes e séries. A publicação preserva a árvore, exige legenda validada e nunca começa sem sua confirmação.</p></div>
+        <span class="result-count" data-curation-total aria-live="polite"></span>
+      </div>
+      <aside class="curation-policy" aria-label="Política da curadoria">
+        <strong>Destino classificado</strong>
+        <span><code>#Avideos/TV/&lt;Título&gt;/Season XX</code> ou <code>#Avideos/Movies/&lt;Título&gt; (Ano)</code>, com legendas externas em <code>Subtitles/</code>.</span>
+        <small>FileCR foi excluído desta ação porque o inventário atual contém software e jogos. Correspondências exatas no Drive não são reenviadas.</small>
+      </aside>
+      <div class="priority-strip" data-curation-priorities aria-label="Prioridades solicitadas"></div>
+      <div class="toolbar curation-toolbar">
+        <label class="search-field"><span class="sr-only">Pesquisar título curado</span><input data-curation-query type="search" placeholder="Título de filme ou série"></label>
+        <select data-curation-kind aria-label="Tipo de mídia"><option value="all">TV e filmes</option><option value="tv">TV e séries</option><option value="movie">Filmes</option></select>
+        <select data-curation-subtitles aria-label="Situação das legendas"><option value="ready" selected>Legenda pronta</option><option value="any">Com e sem legenda</option><option value="missing">Legenda pendente</option></select>
+        <select data-curation-availability aria-label="Localização atual"><option value="all">Todas as localizações</option><option value="torrent">Somente torrent</option><option value="local">Local</option><option value="drive">Já no Drive</option><option value="partial">Parcial</option></select>
+        <button class="primary" data-curation-search type="button">Aplicar filtro</button>
+      </div>
+      <div class="curation-grid" data-curation-grid></div>
+      <div class="empty" data-curation-empty hidden><strong>Nenhum candidato neste recorte</strong><span>Escolha “Com e sem legenda” para também ver o que ainda precisa de legenda.</span></div>
+      <nav class="pagination" data-curation-pagination aria-label="Paginação da curadoria" hidden>
+        <button class="secondary" data-curation-prev type="button">Anterior</button>
+        <span data-curation-page aria-live="polite"></span>
+        <button class="secondary" data-curation-next type="button">Próxima</button>
+      </nav>
+    </section>
+
+    <section class="workspace" id="panel-library" data-view="library" role="tabpanel" aria-labelledby="tab-library" hidden>
       <div class="section-head">
         <div><span class="eyebrow">Streaming</span><h2>Biblioteca de mídia</h2></div>
         <span class="result-count" data-catalog-total aria-live="polite"></span>
